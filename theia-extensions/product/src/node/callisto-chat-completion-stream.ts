@@ -8,7 +8,7 @@ import { injectable } from '@theia/core/shared/inversify';
 import { isThinkingResponsePart, LanguageModelMessage, LanguageModelStreamResponsePart } from '@theia/ai-core';
 import { ChatCompletionStreamingAsyncIterator } from '@theia/ai-openai/lib/node/openai-chat-completion-stream';
 import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-model-utils';
-import { budgetReasoning, CALLISTO_REASONING_SIGNATURE } from '../common/reasoning-text.js';
+import { budgetReasoning, CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from '../common/reasoning-text.js';
 
 /** The field LM Studio, llama.cpp, vLLM and DeepSeek use for reasoning, in streamed deltas and in input messages alike. */
 const REASONING_FIELD = 'reasoning_content';
@@ -37,13 +37,28 @@ interface MessageWithReasoning {
 export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIterator {
 
     protected turnReasoning = '';
+    /**
+     * The `reasoning_effort` to go back to after the model's first action (`''`: none), when the agent asked for this
+     * request to start at a low thinking level to get a looping model to act; undefined otherwise.
+     */
+    protected restoreReasoningEffort: string | undefined;
 
     protected override init(): void {
-        if (isLocalEndpoint(this.options.openai.baseURL) && !this.options.settings?.stream_options) {
+        const settings: Record<string, unknown> = { ...this.options.settings };
+        if (LOW_REASONING_UNTIL_ACTION_SETTING in settings) {
+            if (settings[LOW_REASONING_UNTIL_ACTION_SETTING] === true) {
+                this.restoreReasoningEffort = typeof settings.reasoning_effort === 'string' ? settings.reasoning_effort : '';
+                settings.reasoning_effort = 'low';
+            }
+            // Callisto's own setting: never sent to the server.
+            delete settings[LOW_REASONING_UNTIL_ACTION_SETTING];
+        }
+        if (isLocalEndpoint(this.options.openai.baseURL) && !settings.stream_options) {
             // Theia asks only api.openai.com models for token usage. LM Studio reports it too when asked, and Callisto
             // needs the exact counts: the context-window status bar and the run stats are based on them.
-            (this.options as { settings?: Record<string, unknown> }).settings = { ...this.options.settings, stream_options: { include_usage: true } };
+            settings.stream_options = { include_usage: true };
         }
+        (this.options as { settings?: Record<string, unknown> }).settings = settings;
         super.init();
     }
 
@@ -69,6 +84,17 @@ export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIt
             if (kept) {
                 assistant[REASONING_FIELD] = kept;
             }
+        }
+        if (this.restoreReasoningEffort !== undefined) {
+            // The model acted: the rest of the task runs at the user's thinking level again. Each step's request body
+            // is built from these settings, so the next step already uses it.
+            const settings = this.options.settings as Record<string, unknown>;
+            if (this.restoreReasoningEffort === '') {
+                delete settings.reasoning_effort;
+            } else {
+                settings.reasoning_effort = this.restoreReasoningEffort;
+            }
+            this.restoreReasoningEffort = undefined;
         }
     }
 }

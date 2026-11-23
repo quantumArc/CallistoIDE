@@ -16,18 +16,19 @@ export const CallistoAgentPreferencesSchema: PreferenceSchema = {
             type: 'boolean',
             title: AI_CORE_PREFERENCES_TITLE,
             default: true,
-            markdownDescription: 'Let the Callisto agent interrupt a model whose reasoning goes in circles (the same checks over and over) '
-                + 'or runs far longer than choosing the next step needs, and resume it with a nudge to act. '
-                + 'Everything done so far in the task is kept; only the looping reasoning is dropped.'
+            markdownDescription: 'Let the Callisto agent interrupt a model whose reasoning goes in circles (the same points over and over) '
+                + 'or is about to fill the context window, and resume it with a nudge to act. Everything done so far in the task is kept, '
+                + 'and so is the reasoning before the loop began.'
         },
         [MAX_THINKING_TOKENS_PREF]: {
             type: 'number',
             title: AI_CORE_PREFERENCES_TITLE,
-            default: 16000,
+            default: 0,
             minimum: 0,
             markdownDescription: 'Longest single stretch of reasoning, in tokens, before the Callisto agent asks the model to act. '
-                + 'At about 33 tokens per second, 16000 is about 8 minutes on a local model. `0` turns this limit off '
-                + '(repetition is still caught while `#callisto.agent.loopBreaker#` is on).'
+                + '`0` (the default) sets no limit of its own: the model may think as long as it needs, up to the room left in the context '
+                + 'window. Reasoning models often plan for a long time and then act; interrupting them early tends to make them plan again. '
+                + 'Repetition is caught either way while `#callisto.agent.loopBreaker#` is on.'
         }
     }
 };

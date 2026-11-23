@@ -5,13 +5,14 @@
  ********************************************************************************/
 
 /**
- * Watches a model's reasoning as it streams and reports when it stops making progress. Two patterns, both seen
- * with Inkling 2 Mini on a long coding task:
+ * Watches a model's reasoning as it streams and reports when it stops making progress:
  *
  * - **Repetition**: a self-review that cycles through the same checks over and over ("wait no, after castling the
- *   king goes to g1 …", ten times), until the user stops it.
- * - **Too long**: one uninterrupted block of reasoning far beyond what choosing the next step needs, typically the
- *   whole program being drafted in the reasoning before any of it is written to a file.
+ *   king goes to g1 …"), until the user stops it. Seen with Inkling 2 Mini on the first chess-app run: 76k characters
+ *   of the same move-history checks.
+ * - **Too long**: one block of reasoning longer than a limit. The agent sets that limit from the room left in the
+ *   context window (and an optional user cap), not from how long planning "should" take: left alone, Inkling plans for
+ *   up to ~150k characters and then acts, and interrupting it earlier only made it plan again from scratch.
  */
 
 export interface ThinkingLoopVerdict {
@@ -20,6 +21,8 @@ export interface ThinkingLoopVerdict {
     chars: number;
     /** For 'repetition': a few of the sentences that kept coming back. */
     repeated?: string[];
+    /** For 'repetition': where in the block the loop began (the first occurrence of a repeated sentence). */
+    loopStart?: number;
 }
 
 export interface ThinkingLoopDetectorOptions {
@@ -35,12 +38,16 @@ export interface ThinkingLoopDetectorOptions {
 
 const DEFAULTS = { windowChars: 16000, checkEveryChars: 1500, minSentenceChars: 40 };
 
-/** A sentence seen this often inside the window counts as repeated. */
-const REPEATS_PER_SENTENCE = 3;
+/**
+ * A sentence seen this often inside the window counts as repeated. Tuned on the saved chess-app chats: with 3, a model
+ * second-guessing one table of values ("A pawn on rank 2 is fine …" three times) was cut off at 39k characters of
+ * otherwise productive planning; with 4 the real 76k-character loop is still caught, at 48k.
+ */
+const REPEATS_PER_SENTENCE = 4;
 /** Repetition is reported when this many different sentences repeat (a cycle of checks)... */
 const DISTINCT_REPEATED_SENTENCES = 3;
 /** ...or when any single sentence comes back this often. */
-const REPEATS_OF_ONE_SENTENCE = 5;
+const REPEATS_OF_ONE_SENTENCE = 6;
 
 export class ThinkingLoopDetector {
 
@@ -55,6 +62,11 @@ export class ThinkingLoopDetector {
     /** Characters in the current block of reasoning. */
     get length(): number {
         return this.text.length;
+    }
+
+    /** The current block of reasoning. */
+    get reasoning(): string {
+        return this.text;
     }
 
     /** Adds streamed reasoning; returns a verdict when the reasoning should be interrupted. */
@@ -74,9 +86,12 @@ export class ThinkingLoopDetector {
     }
 
     check(): ThinkingLoopVerdict | undefined {
-        const repeated = this.findRepeatedSentences(this.text.slice(-this.options.windowChars));
+        // Code is removed from the whole block before the window is cut, so a window that starts inside a code block
+        // cannot pair the fences the wrong way round; the result then does not depend on how the stream was chunked.
+        const repeated = this.findRepeatedSentences(withoutCode(this.text).slice(-this.options.windowChars));
         if (repeated) {
-            return { kind: 'repetition', chars: this.text.length, repeated };
+            const starts = repeated.map(sentence => this.text.indexOf(sentence)).filter(index => index >= 0);
+            return { kind: 'repetition', chars: this.text.length, repeated, loopStart: starts.length > 0 ? Math.min(...starts) : undefined };
         }
         if (this.options.maxChars > 0 && this.text.length > this.options.maxChars) {
             return { kind: 'too-long', chars: this.text.length };
@@ -84,11 +99,12 @@ export class ThinkingLoopDetector {
         return undefined;
     }
 
-    protected findRepeatedSentences(window: string): string[] | undefined {
+    /** The repeated sentences, most repeated first, as they were written (trimmed); undefined when there is no loop. */
+    protected findRepeatedSentences(prose: string): string[] | undefined {
         const counts = new Map<string, { count: number; original: string }>();
-        for (const original of window.split(/(?<=[.!?])\s+|\n+/)) {
+        for (const original of prose.split(/(?<=[.!?])\s+|\n+/)) {
             const key = normalizeSentence(original);
-            if (key.length < this.options.minSentenceChars) {
+            if (key.length < this.options.minSentenceChars || looksLikeCode(original)) {
                 continue;
             }
             const entry = counts.get(key);
@@ -100,8 +116,35 @@ export class ThinkingLoopDetector {
         }
         const repeated = [...counts.values()].filter(entry => entry.count >= REPEATS_PER_SENTENCE).sort((a, b) => b.count - a.count);
         const loops = repeated.length >= DISTINCT_REPEATED_SENTENCES || (repeated[0]?.count ?? 0) >= REPEATS_OF_ONE_SENTENCE;
-        return loops ? repeated.slice(0, 3).map(entry => entry.original.slice(0, 160)) : undefined;
+        return loops ? repeated.slice(0, 3).map(entry => entry.original) : undefined;
     }
+}
+
+/**
+ * Debugging means quoting the same few lines of code again and again while tracing them, which is progress, not a loop:
+ * on the chess-app bug fix Inkling quoted `var E = … root.ChessEngine;` five times on its way to finding that `root` is
+ * undefined there, and was interrupted for "repeating" just before writing the fix. Only prose counts, so fenced
+ * blocks (also one still being written) and inline code are left out.
+ */
+export function withoutCode(text: string): string {
+    return text
+        .replace(/```[\s\S]*?(```|$)/g, '\n')
+        .replace(/`[^`\n]*`/g, '');
+}
+
+/**
+ * A line of code or data quoted without backticks: `if (x) {`, `var e = …;`, `return evaluate(state, color);`, or a
+ * row of a table of values (`rank8: [-20, -10, -10, …]`, which Inkling wrote out several times while designing
+ * piece-square tables on the third chess-app run).
+ */
+function looksLikeCode(sentence: string): boolean {
+    const text = sentence.trim();
+    if (/[;{}]$/.test(text) || /^(var|let|const|function|return|if|for|while|else|import|export|class|def)\b/.test(text)) {
+        return true;
+    }
+    const symbols = text.replace(/[^(){}[\];=<>&|]/g, '').length;
+    const letters = text.replace(/[^\p{L}]/gu, '').length;
+    return symbols / text.length > 0.08 || letters / text.length < 0.5;
 }
 
 /** Ignores list numbering, bullets, case, spacing and trailing punctuation, so "157. Good." and "163. good" match. */

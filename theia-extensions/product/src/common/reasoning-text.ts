@@ -13,6 +13,15 @@ const OMITTED = '[… earlier reasoning omitted …]\n';
  */
 export const CALLISTO_REASONING_SIGNATURE = 'callisto:local-reasoning';
 
+/**
+ * Request setting (`true`) by which the Callisto agent asks the backend tool loop to send `reasoning_effort: 'low'`
+ * until the model's first action, and the level the request was made with after that. The agent's last attempt to get
+ * a looping model to act uses it; the task should not stay at a low level afterwards. The backend does the swap because
+ * only there is the level known as Theia resolved it (chat session, then preferences, then the model's default). Never
+ * sent to the server. Switching the level changes only the end of LM Studio's prompt, so its prompt cache keeps matching.
+ */
+export const LOW_REASONING_UNTIL_ACTION_SETTING = 'callisto_low_reasoning_until_action';
+
 /** Reasoning kept from one model turn while the task's budget lasts: its end, where the model settles on what to do. */
 export const MAX_REASONING_CHARS_PER_TURN = 6000;
 /** Reasoning budget for a whole conversation. */

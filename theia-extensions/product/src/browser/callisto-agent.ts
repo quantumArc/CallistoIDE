@@ -28,11 +28,13 @@ import {
     getCallistoRequestContextPrompt, getCallistoReviewModePrompt
 } from '../common/callisto-agent-prompts.js';
 import { ThinkingLoopDetector, ThinkingLoopVerdict } from '../common/thinking-loop-detector.js';
-import { CALLISTO_REASONING_SIGNATURE, keepEnd } from '../common/reasoning-text.js';
+import { CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from '../common/reasoning-text.js';
 import { carriedThinking } from '../common/carried-thinking.js';
-import { CHARS_PER_TOKEN, commandFailed, describe, NudgeContext, nudgeFor, RESUME_THINKING_TOKENS } from '../common/callisto-nudges.js';
+import { commandFailed, describe, keptReasoning, NudgeContext, nudgeFor } from '../common/callisto-nudges.js';
 import { SyntaxCheckResult, SyntaxCheckService } from '../common/syntax-check-protocol.js';
 import { LOOP_BREAKER_PREF, MAX_THINKING_TOKENS_PREF } from './callisto-agent-preferences.js';
+import { contextOverflowMessage, parseContextOverflow } from '../common/context-overflow.js';
+import { LM_STUDIO_PREFIX, LocalModelsContribution } from './local-models-contribution.js';
 
 export const CALLISTO_AGENT_ID = 'Callisto';
 
@@ -42,10 +44,18 @@ const MAX_IDENTICAL_CALLS = 3;
 const MAX_TOOL_CALLS_PER_REQUEST = 100;
 /** Full rewrites of one file allowed per chat request (writing it the first time counts). */
 const MAX_FULL_WRITES_PER_FILE = 2;
-/** Times one chat request may be interrupted and resumed for looping reasoning before Callisto stops it. */
+/**
+ * Interruptions in a row, with no action in between, after which Callisto hands the task back to the user. The last
+ * resume before that is sent at a low thinking level: on the chess-app task Inkling at its default (high) level
+ * thought for 18k characters without acting where at low it wrote its todo list within 43 seconds.
+ */
 const MAX_LOOP_RESUMES = 2;
-/** Reasoning from earlier in the task that is handed back with the nudge, so the model does not plan everything again. */
-const EARLIER_REASONING_NOTE_CHARS = 3000;
+/** Share of the loaded context window a single stretch of reasoning may fill up to, counting the prompt. */
+const CONTEXT_CEILING_RATIO = 0.9;
+/** Reasoning always gets at least this much room, so that a nearly full chat still gets a chance to act. */
+const MIN_THINKING_ROOM_TOKENS = 2000;
+/** Conservative characters per token for the context ceiling (Inkling averages about 2.6). */
+const CEILING_CHARS_PER_TOKEN = 2.5;
 
 /**
  * Tools that can change what other tools return (files, task output). After one of them runs, repeating an
@@ -96,9 +106,11 @@ interface LlmCall {
  *
  * On top of Theia's agent loop it adds:
  * - a short, loop-shaped system prompt (see `callisto-agent-prompts.ts`);
- * - a **loop breaker**: the reasoning is watched while it streams, and when it starts going in circles or runs far
- *   too long, the model call is cancelled and resumed with everything done so far plus a nudge to act. On a long
- *   chess-app task this would have cut a 16-minute self-review loop short;
+ * - a **loop breaker**: the reasoning is watched while it streams, and when it starts going in circles (or is about to
+ *   fill the context window) the model call is cancelled and resumed with everything done so far, what it had worked
+ *   out before the loop, and a nudge to act. Long planning on its own is not interrupted: Inkling plans for a long time
+ *   and then acts, and cutting that short only made it plan again. On a long chess-app task this would have cut a
+ *   16-minute self-review loop short;
  * - a **loop guard** on tool calls: repeated identical calls, repeated full rewrites of one file, and calls past a
  *   per-request budget are answered with an instruction to change course instead of being run.
  */
@@ -113,6 +125,9 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
 
     @inject(SyntaxCheckService)
     protected readonly syntaxCheckService: SyntaxCheckService;
+
+    @inject(LocalModelsContribution)
+    protected readonly localModels: LocalModelsContribution;
 
     id = CALLISTO_AGENT_ID;
     name = CALLISTO_AGENT_ID;
@@ -152,6 +167,28 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     protected readonly nudges = new WeakMap<object, string>();
 
     /**
+     * Replaces a server's raw "request exceeds the available context size" 400 with what happened and what to do,
+     * in the chat and in the error notification alike. Everything else is handled as Theia does.
+     */
+    protected override handleError(request: MutableChatRequestModel, error: Error): void {
+        const overflow = parseContextOverflow(error?.message);
+        if (!overflow) {
+            return super.handleError(request, error);
+        }
+        const modelId = this.llmCalls.get(request)?.languageModel.id ?? request.response.languageModel;
+        const lmStudio = !!modelId?.startsWith(LM_STUDIO_PREFIX);
+        const message = contextOverflowMessage(overflow, {
+            model: modelId?.replace(/^[^/]+\//, ''),
+            maxContext: this.localModels.getLmStudioInfo(modelId)?.context?.max,
+            chatHasHistory: request.session.getRequests().length > 1 || request.response.response.content.length > 0,
+            lmStudio
+        });
+        this.logger.warn('Request did not fit in the model\'s context window:', error.message);
+        // No `cause`: Theia appends the cause chain's messages, which would bring the raw 400 back.
+        super.handleError(request, Object.assign(new Error(message), { stack: error.stack }));
+    }
+
+    /**
      * Same as Theia's, except that the request gets its own cancellation, linked to the user's stop button, so the
      * loop breaker can stop the model without ending the chat request; and every tool goes through the loop guard.
      */
@@ -162,7 +199,8 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         deferredToolIds: string[] | undefined,
         languageModel: LanguageModel,
         promptVariantId?: string,
-        isPromptVariantCustomized?: boolean
+        isPromptVariantCustomized?: boolean,
+        options: { lowReasoningUntilAction?: boolean } = {}
     ): Promise<LanguageModelResponse> {
         const previous = this.llmCalls.get(request);
         previous?.cancellationLink.dispose();
@@ -182,6 +220,12 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         }
         const tools = this.deduplicateTools(toolRequests.map(tool => this.withLoopGuard(request, tool)));
         const { commonSettings, providerSettings } = this.getSessionSettings(request);
+        let settings: Record<string, unknown> = { ...this.getLlmSettings(), ...providerSettings };
+        if (options.lowReasoningUntilAction && supportsLowReasoning(languageModel)) {
+            // The backend tool loop sends 'low' until the model acts, then the level resolved for this request
+            // (see CallistoChatCompletionStream).
+            settings = { ...settings, [LOW_REASONING_UNTIL_ACTION_SETTING]: true };
+        }
         const vendor = languageModel.vendor;
         const enabledServerTools = vendor
             ? (request.request.serverToolSelections?.[vendor] ?? []).filter(id => languageModel.serverTools?.some(tool => tool.id === id))
@@ -191,7 +235,7 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
             tools: tools.length > 0 ? tools : undefined,
             deferredToolIds,
             serverTools: enabledServerTools.length > 0 ? enabledServerTools : undefined,
-            settings: { ...this.getLlmSettings(), ...providerSettings },
+            settings,
             reasoning: commonSettings?.reasoning,
             compaction: commonSettings?.compaction,
             agentId: this.id,
@@ -205,68 +249,94 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
 
     // ---------------------------------------------------------------- loop breaker
 
+    /**
+     * Streams the model's work into the response, interrupting it when its reasoning loops or is about to fill the
+     * context window. After an interruption the model is resumed with what it had worked out so far and a nudge to act;
+     * the last resume runs at a low thinking level. If it still does not act, the task goes back to the user, with the
+     * model's reasoning kept in the chat so that "continue" picks up from there.
+     */
     protected override async addStreamResponse(languageModelResponse: LanguageModelStreamResponse, request: MutableChatRequestModel): Promise<void> {
         let response: LanguageModelResponse = languageModelResponse;
-        let resumes = 0;
-        for (; ; resumes++) {
+        // Interruptions in a row with no action in between.
+        let attempts = 0;
+        let triedLowReasoning = false;
+        for (; ;) {
             if (!isLanguageModelStreamResponse(response)) {
                 await super.addContentsToResponse(response, request);
                 return;
             }
-            const { verdict, acted } = await this.streamWithLoopBreaker(response, request, resumes > 0);
+            const outcome = await this.streamWithLoopBreaker(response, request);
+            const { verdict } = outcome;
             if (!verdict || request.response.cancellationToken.isCancellationRequested) {
                 return;
             }
-            if (acted) {
+            if (outcome.acted) {
                 // It made progress after the last nudge, so this is a new episode, not the same loop coming back.
-                resumes = 0;
+                attempts = 0;
+                triedLowReasoning = false;
             }
-            if (resumes >= MAX_LOOP_RESUMES) {
-                request.response.response.addContent(new InformationalChatResponseContentImpl(
-                    `Callisto stopped the model: its reasoning ${describe(verdict)} again, after ${MAX_LOOP_RESUMES} nudges to act. `
-                    + 'The work done so far is kept. Try a smaller step, a lower thinking level, or more specific instructions.'));
+            attempts++;
+            const context: NudgeContext = {
+                step: this.currentTodoStep(request),
+                hasTodoList: this.hasTodoList(request),
+                reasoning: keptReasoning(outcome.reasoning, verdict),
+                contextFull: outcome.contextFull
+            };
+            if (attempts > MAX_LOOP_RESUMES) {
+                const handBack = new InformationalChatResponseContentImpl(
+                    `Callisto paused the task: the model's reasoning ${describe(verdict, outcome.contextFull)} again, after ${MAX_LOOP_RESUMES} `
+                    + `attempts to get it to act${triedLowReasoning ? ' (the last one at a low thinking level)' : ''}. Its work and what it had `
+                    + 'worked out are kept in this chat. Reply "continue" to let it carry on, or give it a smaller first step.');
+                request.response.response.addContent(handBack);
+                // Replayed before the user's next message, so that "continue" starts from the model's reasoning, not from zero.
+                this.nudges.set(handBack, nudgeFor(verdict, { ...context, pausedForUser: true }));
                 return;
             }
+            const lastAttempt = attempts === MAX_LOOP_RESUMES;
+            const lowReasoning = lastAttempt && supportsLowReasoning(this.llmCalls.get(request)?.languageModel);
+            triedLowReasoning ||= lowReasoning;
             const notice = new InformationalChatResponseContentImpl(
-                `Callisto interrupted the model because its reasoning ${describe(verdict)}, and asked it to take the next concrete step.`);
+                `Callisto interrupted the model because its reasoning ${describe(verdict, outcome.contextFull)}. It keeps what it had worked `
+                + `out and is asked to act${lowReasoning ? ', this time at a low thinking level until its first action' : ''}.`);
             request.response.response.addContent(notice);
-            response = await this.resume(request, verdict, notice);
+            response = await this.resume(request, nudgeFor(verdict, { ...context, lastAttempt }), notice, lowReasoning);
         }
     }
 
     /**
-     * Streams one model call into the response, cancelling it as soon as the reasoning loops. A call that resumes after
-     * an interruption gets only {@link RESUME_THINKING_TOKENS} of reasoning before its first action.
-     * @returns the verdict that stopped it, if any, and whether the model acted (called a tool or wrote text) before that.
+     * Streams one model call into the response, cancelling it as soon as the reasoning loops or would fill the context.
+     * @returns the verdict that stopped it, if any; whether the model acted (called a tool or wrote text) before that;
+     *   the interrupted block of reasoning; and whether the limit it hit was the room left in the context window.
      */
     protected async streamWithLoopBreaker(
-        response: LanguageModelStreamResponse, request: MutableChatRequestModel, resumed: boolean
-    ): Promise<{ verdict?: ThinkingLoopVerdict; acted: boolean }> {
+        response: LanguageModelStreamResponse, request: MutableChatRequestModel
+    ): Promise<{ verdict?: ThinkingLoopVerdict; acted: boolean; reasoning: string; contextFull: boolean }> {
         if (!this.preferences.get<boolean>(LOOP_BREAKER_PREF, true)) {
             await super.addStreamResponse(response, request);
-            return { acted: true };
+            return { acted: true, reasoning: '', contextFull: false };
         }
-        const maxTokens = this.preferences.get<number>(MAX_THINKING_TOKENS_PREF, 16000);
-        const maxChars = Math.round(maxTokens * CHARS_PER_TOKEN);
-        // 0 disables the length check; the tighter first-step budget must not switch it back on.
-        const firstStepChars = resumed && maxChars > 0 ? Math.min(maxChars, Math.round(RESUME_THINKING_TOKENS * CHARS_PER_TOKEN)) : maxChars;
-        let detector = new ThinkingLoopDetector({ maxChars: firstStepChars });
         const call = this.llmCalls.get(request);
+        // One detector per block of reasoning, created when the block starts: by then the token usage of the previous
+        // model call is known, so the room left in the context window is up to date.
+        let detector: ThinkingLoopDetector | undefined;
+        let contextFull = false;
         let verdict: ThinkingLoopVerdict | undefined;
         let acted = false;
+        const startBlock = (): ThinkingLoopDetector => {
+            const limit = this.thinkingLimit(request);
+            contextFull = limit.contextFull;
+            return new ThinkingLoopDetector({ maxChars: limit.maxChars });
+        };
         async function* watched(): AsyncIterable<unknown> {
             for await (const part of response.stream) {
                 if (isThinkingResponsePart(part)) {
+                    detector ??= startBlock();
                     verdict = detector.push(part.thought);
                 } else if (isToolCallResponsePart(part) || (isTextResponsePart(part) && part.content.trim().length > 0)) {
                     // A tool call or answer text: the model acted, so a new block of reasoning starts after it. Other
                     // parts (empty deltas the OpenAI stream sends between reasoning chunks, usage) are not actions.
-                    if (acted) {
-                        detector.reset();
-                    } else {
-                        acted = true;
-                        detector = new ThinkingLoopDetector({ maxChars });
-                    }
+                    acted = true;
+                    detector = undefined;
                 }
                 yield part;
                 if (verdict) {
@@ -276,27 +346,57 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
             }
         }
         await super.addStreamResponse({ ...response, stream: watched() } as LanguageModelStreamResponse, request);
-        return { verdict, acted };
+        // `detector` is assigned inside the generator; TypeScript cannot see that.
+        const interrupted = detector as ThinkingLoopDetector | undefined;
+        return { verdict, acted, reasoning: verdict ? interrupted?.reasoning ?? '' : '', contextFull };
+    }
+
+    /**
+     * How much the model may reason before its next action: the user's limit, if one is set, and the room left in the
+     * context window. There is no limit of Callisto's own: left alone, Inkling plans for up to ~150k characters and then
+     * acts, while interrupting it earlier only made it plan again.
+     */
+    protected thinkingLimit(request: MutableChatRequestModel): { maxChars: number; contextFull: boolean } {
+        const capTokens = Math.max(0, this.preferences.get<number>(MAX_THINKING_TOKENS_PREF, 0) ?? 0);
+        const roomTokens = this.contextRoomTokens(request);
+        if (roomTokens === undefined || (capTokens > 0 && capTokens <= roomTokens)) {
+            return { maxChars: Math.round(capTokens * CEILING_CHARS_PER_TOKEN), contextFull: false };
+        }
+        return { maxChars: Math.round(roomTokens * CEILING_CHARS_PER_TOKEN), contextFull: true };
+    }
+
+    /** Tokens left for reasoning in the context window the model is loaded with; undefined when that is not known. */
+    protected contextRoomTokens(request: MutableChatRequestModel): number | undefined {
+        const call = this.llmCalls.get(request);
+        const loaded = this.localModels.getLmStudioInfo(call?.languageModel.id)?.context?.loaded;
+        if (!loaded || !call) {
+            return undefined;
+        }
+        const usage = request.response.tokenUsage;
+        const used = usage && usage.inputTokens > 0
+            ? usage.inputTokens + usage.outputTokens
+            : Math.round(JSON.stringify(call.messages).length / CEILING_CHARS_PER_TOKEN);
+        return Math.max(MIN_THINKING_ROOM_TOKENS, Math.floor(loaded * CONTEXT_CEILING_RATIO) - used);
     }
 
     /**
      * Sends the request again with everything done so far in this task (tool calls and their results, the reasoning
-     * that led to them) but without the looping reasoning, plus a nudge to act. The nudge names the current step of the
-     * todo list and hands back the end of the model's earlier reasoning, so that it does not plan the whole task again.
-     * The nudge is tied to the interruption notice, so that `getMessages` replays it in that place from now on.
+     * that led to them) plus the nudge, which carries what the model had worked out before the interruption. The nudge
+     * is tied to the interruption notice, so that `getMessages` replays it in that place from now on.
      */
-    protected async resume(request: MutableChatRequestModel, verdict: ThinkingLoopVerdict, notice: object): Promise<LanguageModelResponse> {
+    protected async resume(
+        request: MutableChatRequestModel, nudge: string, notice: object, lowReasoningUntilAction: boolean
+    ): Promise<LanguageModelResponse> {
         const call = this.llmCalls.get(request);
         if (!call) {
             throw new Error('Callisto: no model call to resume.');
         }
-        const context: NudgeContext = { step: this.currentTodoStep(request), earlierReasoning: this.earlierReasoning(request) };
-        this.nudges.set(notice, nudgeFor(verdict, context));
+        this.nudges.set(notice, nudge);
         const system = call.messages.filter(message => message.actor === 'system');
         const history = await this.getMessages(request.session, true);
         return this.sendLlmRequest(
             request, [...system, ...history], call.tools, call.deferredToolIds, call.languageModel,
-            call.promptVariantId, call.isPromptVariantCustomized
+            call.promptVariantId, call.isPromptVariantCustomized, { lowReasoningUntilAction }
         );
     }
 
@@ -406,15 +506,9 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         return undefined;
     }
 
-    /** The end of the reasoning this task produced before the block that was just interrupted. */
-    protected earlierReasoning(request: MutableChatRequestModel): string | undefined {
-        const blocks = request.response.response.content
-            .filter(ThinkingChatResponseContent.is)
-            .map(part => part.content.trim())
-            .filter(text => text.length > 0);
-        // The last block is the one that looped: leave it out.
-        const earlier = blocks.slice(0, -1).slice(-2).join('\n\n');
-        return earlier ? keepEnd(earlier, EARLIER_REASONING_NOTE_CHARS) : undefined;
+    /** Whether the model has written a todo list in this task. */
+    protected hasTodoList(request: MutableChatRequestModel): boolean {
+        return request.response.response.content.some(part => ToolCallChatResponseContent.is(part) && part.name === TODO_WRITE_FUNCTION_ID);
     }
 
     // ---------------------------------------------------------------- loop guard on tool calls
@@ -516,6 +610,14 @@ function isCarriedThinking(message: LanguageModelMessage): boolean {
 /** LM Studio models, which Callisto registers as `lmstudio/<id>` on the OpenAI-compatible provider. */
 function carriesReasoning(languageModel: LanguageModel): boolean {
     return languageModel.id.startsWith('lmstudio/');
+}
+
+/**
+ * Whether the agent can send one request at a low thinking level and have the backend put the level back afterwards:
+ * LM Studio models (served through Callisto's tool loop, which handles that) that offer a 'low' level.
+ */
+function supportsLowReasoning(languageModel: LanguageModel | undefined): boolean {
+    return !!languageModel && carriesReasoning(languageModel) && !!languageModel.reasoningSupport?.supportedLevels.includes('low');
 }
 
 /** The request's images, as Theia's own history adds them. */

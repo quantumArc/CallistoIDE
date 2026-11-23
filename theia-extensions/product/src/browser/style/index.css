@@ -184,6 +184,14 @@ body .theia-thinking-preview {
     max-height: min(16lh, 40vh);
 }
 
+/*
+ * Callisto: the preview's text is positioned, so that its lines are always measured from it, also while a slide
+ * transforms it (see ThinkingPreview in callisto-thinking-part-renderer.tsx).
+ */
+.callisto-thinking-preview .theia-thinking-preview-text {
+    position: relative;
+}
+
 /* Callisto: elapsed time, tokens and speed after 'Thinking', set by CallistoThinkingPartRenderer. */
 .callisto-thinking-stats .theia-thinking-status::after {
     content: var(--callisto-thinking-stats, '');
