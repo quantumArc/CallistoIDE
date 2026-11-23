@@ -1,0 +1,28 @@
+{
+    "compilerOptions": {
+        "skipLibCheck": true,
+        "declaration": true,
+        "declarationMap": true,
+        "noImplicitAny": true,
+        "noEmitOnError": false,
+        "noImplicitThis": true,
+        "noUnusedLocals": true,
+        "strictNullChecks": true,
+        "experimentalDecorators": true,
+        "emitDecoratorMetadata": false,
+        "esModuleInterop": true,
+        "downlevelIteration": true,
+        "resolveJsonModule": true,
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "target": "ES2017",
+        "jsx": "react",
+        "lib": [
+            "ES2017",
+            "ES2020.Promise",
+            "dom"
+        ],
+        "sourceMap": true,
+        "composite": true
+    }
+}

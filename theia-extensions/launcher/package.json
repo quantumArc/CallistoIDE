@@ -1,0 +1,45 @@
+{
+  "name": "theia-ide-launcher-ext",
+  "version": "1.77.0",
+  "keywords": [
+    "theia-extension"
+  ],
+  "license": "MIT",
+  "files": [
+    "lib",
+    "src"
+  ],
+  "dependencies": {
+    "@theia/core": "1.77.0",
+    "@vscode/sudo-prompt": "9.3.2",
+    "body-parser": "^1.20.9"
+  },
+  "devDependencies": {
+    "rimraf": "^2.7.1",
+    "typescript": "~5.9.3"
+  },
+  "scripts": {
+    "clean": "rimraf lib *.tsbuildinfo",
+    "build": "tsc -b",
+    "lint": "eslint --ext js,jsx,ts,tsx src",
+    "lint:fix": "eslint --ext js,jsx,ts,tsx src --fix",
+    "watch": "tsc -w",
+    "update:theia": "ts-node ../../scripts/update-theia-version.ts",
+    "update:next": "ts-node ../../scripts/update-theia-version.ts next"
+  },
+  "theiaExtensions": [
+    {
+      "frontendElectron": "lib/browser/create-launcher-frontend-module",
+      "backend": "lib/node/launcher-backend-module"
+    }
+  ],
+  "type": "module",
+  "exports": {
+    "./package.json": "./package.json",
+    "./lib/*.json": "./lib/*.json",
+    "./lib/*.js": "./lib/*.js",
+    "./lib/*": "./lib/*.js",
+    "./*": "./*"
+  },
+  "description": ""
+}

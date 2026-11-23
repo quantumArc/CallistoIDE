@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2140"/>
+      <stop offset="1" stop-color="#0a0d1c"/>
+    </linearGradient>
+    <radialGradient id="moon" cx="0.36" cy="0.32" r="0.78">
+      <stop offset="0" stop-color="#c9b8a0"/>
+      <stop offset="0.45" stop-color="#8a7560"/>
+      <stop offset="0.85" stop-color="#3f3328"/>
+      <stop offset="1" stop-color="#241c16"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.6" stop-color="#7aa7ff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#7aa7ff" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="moonClip"><circle cx="512" cy="512" r="268"/></clipPath>
+    <radialGradient id="shade" cx="0.3" cy="0.3" r="0.95">
+      <stop offset="0.45" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.55"/>
+    </radialGradient>
+  </defs>
+  <!-- macOS-style rounded square, inset to the standard 824px icon grid -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <circle cx="300" cy="250" r="5" fill="#ffffff" opacity="0.7"/>
+  <circle cx="760" cy="230" r="4" fill="#ffffff" opacity="0.55"/>
+  <circle cx="820" cy="700" r="5" fill="#ffffff" opacity="0.5"/>
+  <circle cx="230" cy="760" r="4" fill="#ffffff" opacity="0.5"/>
+  <circle cx="512" cy="512" r="320" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="268" fill="url(#moon)"/>
+  <g clip-path="url(#moonClip)">
+    <!-- Valhalla-style multi-ring basin -->
+    <circle cx="430" cy="440" r="70" fill="#e8dcc8" opacity="0.55"/>
+    <circle cx="430" cy="440" r="105" fill="none" stroke="#e8dcc8" stroke-width="6" opacity="0.28"/>
+    <circle cx="430" cy="440" r="140" fill="none" stroke="#e8dcc8" stroke-width="4" opacity="0.16"/>
+    <!-- bright ice-crater speckles -->
+    <g fill="#f4ecdf">
+      <circle cx="620" cy="360" r="16" opacity="0.8"/>
+      <circle cx="660" cy="520" r="11" opacity="0.7"/>
+      <circle cx="560" cy="640" r="20" opacity="0.65"/>
+      <circle cx="380" cy="620" r="12" opacity="0.6"/>
+      <circle cx="700" cy="420" r="8" opacity="0.6"/>
+      <circle cx="300" cy="500" r="9" opacity="0.5"/>
+      <circle cx="520" cy="300" r="10" opacity="0.7"/>
+      <circle cx="470" cy="720" r="9" opacity="0.45"/>
+      <circle cx="640" cy="690" r="7" opacity="0.45"/>
+      <circle cx="590" cy="460" r="6" opacity="0.6"/>
+      <circle cx="350" cy="350" r="7" opacity="0.55"/>
+      <circle cx="740" cy="590" r="6" opacity="0.4"/>
+    </g>
+    <!-- terminator shadow -->
+    <circle cx="512" cy="512" r="268" fill="url(#shade)"/>
+  </g>
+  <!-- code chevrons orbiting the moon -->
+  <g fill="none" stroke="#8fb4ff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="236,430 172,512 236,594"/>
+    <polyline points="788,430 852,512 788,594"/>
+  </g>
+</svg>

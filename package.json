@@ -1,0 +1,89 @@
+{
+  "private": true,
+  "name": "callisto",
+  "description": "Callisto: an AI code editor for local models, built on Eclipse Theia",
+  "version": "1.77.0",
+  "license": "MIT",
+  "engines": {
+    "yarn": ">=1.7.0 <2",
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@theia/cli": "1.77.0",
+    "@types/yargs": "^17",
+    "@typescript-eslint/eslint-plugin": "^4.33.0",
+    "@typescript-eslint/eslint-plugin-tslint": "^4.33.0",
+    "@typescript-eslint/parser": "^4.33.0",
+    "eslint": "^7.32.0",
+    "eslint-plugin-deprecation": "1.2.1",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-no-null": "^1.0.2",
+    "eslint-plugin-no-unsanitized": "^3.2.0",
+    "eslint-plugin-react": "^7.37.5",
+    "lerna": "^9.0.7",
+    "node-gyp": "^11.5.0",
+    "rimraf": "^2.7.1",
+    "ts-node": "^10.9.2",
+    "type-fest": "^0.20.2",
+    "yargs": "^17.7.3"
+  },
+  "scripts": {
+    "clean": "lerna run clean && rimraf node_modules",
+    "build": "yarn build:extensions && yarn build:applications",
+    "build:dev": "yarn build:extensions && yarn build:applications:dev",
+    "build:applications": "lerna run --scope=\"theia-ide*app\" build:prod --concurrency 1",
+    "build:applications:dev": "lerna run --scope=\"theia-ide*app\" build --concurrency 1",
+    "build:extensions": "lerna run --scope=\"theia-ide*ext\" build",
+    "download:plugins": "theia download:plugins --rate-limit=15 --parallel=false && yarn permissions:writeable",
+    "package:applications": "lerna run --scope=\"theia-ide*app\" package --concurrency 1",
+    "package:applications:preview": "lerna run --scope=\"theia-ide*app\" package:preview --concurrency 1",
+    "package:applications:prod": "lerna run --scope=\"theia-ide*app\" package:prod --concurrency 1",
+    "permissions:writeable": "ts-node scripts/make-files-writeable.ts plugins",
+    "watch": "lerna run --parallel watch",
+    "test": "lerna run test",
+    "electron": "yarn --cwd applications/electron",
+    "browser": "yarn --cwd applications/browser",
+    "update:theia": "ts-node scripts/update-theia-version.ts",
+    "update:theia:children": "lerna run update:theia -- ",
+    "lint": "eslint --ext js,jsx,ts,tsx scripts && lerna run lint",
+    "lint:fix": "eslint --ext js,jsx,ts,tsx scripts --fix && lerna run lint:fix",
+    "postinstall": "theia-patch"
+  },
+  "theiaPluginsDir": "plugins",
+  "theiaPlugins": {
+    "vscode-builtin-extensions": "https://github.com/eclipse-theia/vscode-builtin-extensions/releases/download/1.108.2/vscode-builtin-extensions-1.108.2.tar.gz",
+    "vscjava.vscode-java-pack": "https://open-vsx.org/api/vscjava/vscode-java-pack/0.30.5/file/vscjava.vscode-java-pack-0.30.5.vsix",
+    "vscjava.vscode-java-dependency": "https://open-vsx.org/api/vscjava/vscode-java-dependency/0.27.0/file/vscjava.vscode-java-dependency-0.27.0.vsix"
+  },
+  "theiaPluginsExcludeIds": [
+    "ms-vscode.js-debug-companion",
+    "vscode.extension-editing",
+    "vscode.microsoft-authentication"
+  ],
+  "workspaces": [
+    "applications/*",
+    "theia-extensions/*"
+  ],
+  "resolutions": {
+    "@types/puppeteer": "^5.4.7",
+    "**/yauzl": "^3.3.1",
+    "**/@tootallnate/once": "^2.0.1",
+    "**/adm-zip": "^0.6.1",
+    "**/axios": "^1.20.0",
+    "**/basic-ftp": "^6.2.4",
+    "**/cross-spawn": "^7.0.6",
+    "**/dompurify": "^3.4.17",
+    "**/follow-redirects": "^1.16.2",
+    "**/globule/minimatch": "^3.1.5",
+    "**/mocha/diff": "^8.0.3",
+    "**/nx/brace-expansion": "^5.0.12",
+    "**/pacote": "^21.5.1",
+    "**/serialize-javascript": "^7.1.3",
+    "**/smol-toml": "^1.9.1",
+    "**/tmp": "^0.2.7",
+    "**/tar": "^7.5.22",
+    "**/uuid": "^11.1.1",
+    "**/mocha": "^11.0.0",
+    "lerna/js-yaml": "^4.3.2"
+  }
+}
