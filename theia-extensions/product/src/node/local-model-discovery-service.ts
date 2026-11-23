@@ -22,6 +22,8 @@ interface LmStudioV1Model {
     type?: string;
     architecture?: string;
     capabilities?: { reasoning?: { allowed_options?: string[]; default?: string } };
+    max_context_length?: number;
+    loaded_instances?: { config?: { context_length?: number; parallel?: number } }[];
 }
 
 /** An entry of LM Studio's older `GET /api/v0/models`. */
@@ -82,13 +84,18 @@ export class LocalModelDiscoveryServiceImpl implements LocalModelDiscoveryServic
     }
 
     protected toLmStudioInfo(model: LmStudioV1Model): LocalModelInfo {
+        const info: LocalModelInfo = { id: model.key };
+        const loaded = model.loaded_instances?.[0]?.config;
+        if (loaded?.context_length || model.max_context_length) {
+            info.context = { loaded: loaded?.context_length, max: model.max_context_length, parallel: loaded?.parallel };
+        }
         const reasoning = model.capabilities?.reasoning;
         const levels = GRADED_LEVELS.filter(level => reasoning?.allowed_options?.includes(level));
-        if (!levels.length) {
-            return { id: model.key };
+        if (levels.length) {
+            const defaultLevel = reasoning?.default && levels.includes(reasoning.default) ? reasoning.default : undefined;
+            info.reasoning = { levels, defaultLevel };
         }
-        const defaultLevel = reasoning?.default && levels.includes(reasoning.default) ? reasoning.default : undefined;
-        return { id: model.key, reasoning: { levels, defaultLevel } };
+        return info;
     }
 
     protected async getJson<T>(url: string): Promise<T> {

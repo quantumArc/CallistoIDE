@@ -52,17 +52,28 @@ Fixing a written file is cheaper than drafting it twice.
 - If you catch yourself going over the same points again, stop and act. Callisto interrupts reasoning that goes in circles \
 or runs very long without an action.`;
 
-const CONTEXT = `# Context
-{{${CONTEXT_FILES_VARIABLE_ID}}}
+/*
+ * Only what stays the same for the whole session goes into the system prompt. LM Studio reuses its cached prompt only
+ * up to the first token that differs, so anything that changes between requests (files changed so far, open editors,
+ * context files) would make it re-read the entire conversation on every follow-up message. That part is resolved per
+ * request from CALLISTO_REQUEST_CONTEXT_ID instead, and the agent places it right after that request's message.
+ */
+const CONTEXT = `{{prompt:${AGENTS_MD_PROMPT_FRAGMENT_ID}}}`;
+
+export const CALLISTO_REQUEST_CONTEXT_ID = 'callisto-request-context';
+
+const REQUEST_CONTEXT = `{{${CONTEXT_FILES_VARIABLE_ID}}}
 
 ## Files changed so far
 {{${CHANGE_SET_SUMMARY_VARIABLE_ID}}}
 
-{{prompt:${AGENTS_MD_PROMPT_FRAGMENT_ID}}}
-
 {{prompt:${OPEN_EDITORS_HINT_FRAGMENT_ID}}}
 
 {{${TASK_CONTEXT_SUMMARY_VARIABLE_ID}}}`;
+
+export function getCallistoRequestContextPrompt(): BasePromptFragment {
+    return { id: CALLISTO_REQUEST_CONTEXT_ID, template: REQUEST_CONTEXT };
+}
 
 function agentModeTemplate(): string {
     return `# Role

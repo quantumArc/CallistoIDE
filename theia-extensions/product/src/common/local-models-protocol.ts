@@ -17,6 +17,8 @@ export interface LocalModelInfo {
      * order, and the model's own default. Absent for models that can only turn thinking on or off, or none at all.
      */
     reasoning?: { levels: string[]; defaultLevel?: string };
+    /** LM Studio only: context length the model is loaded with, the most it supports, and its parallel request slots. */
+    context?: { loaded?: number; max?: number; parallel?: number };
 }
 
 export interface LocalModelListResult {

@@ -6,7 +6,7 @@
 
 import { inject, injectable } from '@theia/core/shared/inversify';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser';
-import { Command, CommandContribution, CommandRegistry, MessageService, PreferenceService } from '@theia/core';
+import { Command, CommandContribution, CommandRegistry, Emitter, Event, MessageService, PreferenceService } from '@theia/core';
 import { ReasoningLevel, ReasoningSupport } from '@theia/ai-core';
 import { OpenAiLanguageModelsManager, OpenAiModelDescription } from '@theia/ai-openai/lib/common';
 import { OLLAMA_REASONING_SUPPORT, OllamaLanguageModelsManager } from '@theia/ai-ollama/lib/common';
@@ -22,7 +22,7 @@ export const REFRESH_LOCAL_MODELS: Command = {
     label: 'Refresh Local Models'
 };
 
-const LM_STUDIO_PREFIX = 'lmstudio/';
+export const LM_STUDIO_PREFIX = 'lmstudio/';
 const OLLAMA_PREFIX = 'ollama/';
 const MAX_RETRIES_PREF = 'ai-features.modelSettings.maxRetries';
 
@@ -61,6 +61,16 @@ export class LocalModelsContribution implements FrontendApplicationContribution,
     protected ollamaModels = new Set<string>();
     protected timer: ReturnType<typeof setInterval> | undefined;
     protected pending: Promise<RefreshSummary> | undefined;
+    /** What LM Studio last reported about each model, by id (without the `lmstudio/` prefix). */
+    protected lmStudioInfo = new Map<string, LocalModelInfo>();
+    protected readonly onDidChangeLmStudioInfoEmitter = new Emitter<void>();
+    /** Fires after each refresh that reached LM Studio, e.g. when a model was reloaded with another context length. */
+    readonly onDidChangeLmStudioInfo: Event<void> = this.onDidChangeLmStudioInfoEmitter.event;
+
+    /** LM Studio's info for a Callisto model id such as `lmstudio/thinkingmachines/inkling-2-mini`. */
+    getLmStudioInfo(languageModelId: string | undefined): LocalModelInfo | undefined {
+        return languageModelId?.startsWith(LM_STUDIO_PREFIX) ? this.lmStudioInfo.get(languageModelId.slice(LM_STUDIO_PREFIX.length)) : undefined;
+    }
 
     onStart(): void {
         this.preferences.ready.then(() => {
@@ -152,6 +162,8 @@ export class LocalModelsContribution implements FrontendApplicationContribution,
         }
         this.lmStudioModels = current;
         this.lmStudioUrl = url;
+        this.lmStudioInfo = new Map(models.map(model => [model.id, model]));
+        this.onDidChangeLmStudioInfoEmitter.fire();
     }
 
     protected toReasoningSupport(model: LocalModelInfo): ReasoningSupport | undefined {

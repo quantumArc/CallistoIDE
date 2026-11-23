@@ -24,8 +24,10 @@ import { TheiaIDEContribution } from './theia-ide-contribution.js';
 import { TheiaIDEGettingStartedWidget } from './theia-ide-getting-started-widget.js';
 import { LocalModelsContribution } from './local-models-contribution.js';
 import { AiRunStatsService } from './ai-run-stats.js';
+import { ContextStatusContribution } from './context-status-contribution.js';
 import { CallistoAgent } from './callisto-agent.js';
 import { CallistoAgentPreferencesSchema } from './callisto-agent-preferences.js';
+import { SYNTAX_CHECK_PATH, SyntaxCheckService } from '../common/syntax-check-protocol.js';
 import { Agent } from '@theia/ai-core/lib/common';
 import { ChatAgent } from '@theia/ai-chat/lib/common';
 import { CallistoThinkingPartRenderer } from './callisto-thinking-part-renderer.js';
@@ -72,6 +74,10 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     // Elapsed time, tokens and tokens/second of AI runs: in the status bar and on the 'Thinking' line.
     bind(AiRunStatsService).toSelf().inSingletonScope();
     bind(FrontendApplicationContribution).toService(AiRunStatsService);
+
+    // How full the active chat's context window is, against the context length LM Studio loaded the model with.
+    bind(ContextStatusContribution).toSelf().inSingletonScope();
+    bind(FrontendApplicationContribution).toService(ContextStatusContribution);
     bind(CallistoThinkingPartRenderer).toSelf().inSingletonScope();
     bind(ChatResponsePartRenderer).toService(CallistoThinkingPartRenderer);
     bind(CallistoNoticeRenderer).toSelf().inSingletonScope();
@@ -79,6 +85,9 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
 
     // Callisto's own coding agent, tuned for local models.
     bind(PreferenceContribution).toConstantValue({ schema: CallistoAgentPreferencesSchema });
+    bind(SyntaxCheckService).toDynamicValue(ctx =>
+        ctx.container.get<ServiceConnectionProvider>(RemoteConnectionProvider).createProxy<SyntaxCheckService>(SYNTAX_CHECK_PATH)
+    ).inSingletonScope();
     bind(CallistoAgent).toSelf().inSingletonScope();
     bind(Agent).toService(CallistoAgent);
     bind(ChatAgent).toService(CallistoAgent);
