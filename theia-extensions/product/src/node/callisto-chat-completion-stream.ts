@@ -79,6 +79,9 @@ export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIt
         const assistantIndex = this.messages.length;
         await super.executeAndAppendToolCalls(...args);
         const assistant = this.messages[assistantIndex] as MessageWithReasoning | undefined;
+        if (assistant?.role === 'assistant') {
+            rememberToolCallTurn((assistant.tool_calls ?? []).map(call => call.id));
+        }
         if (assistant?.role === 'assistant' && isLocalEndpoint(this.options.openai.baseURL)) {
             const kept = budgetReasoning(reasoning, reasoningChars(this.messages.slice(0, assistantIndex) as MessageWithReasoning[]));
             if (kept) {
@@ -127,7 +130,7 @@ export class CallistoOpenAiModelUtils extends OpenAiModelUtils {
                 pending = '';
             }
         }
-        const result = super.processMessages(...args);
+        const result = regroupParallelToolCalls(super.processMessages(...args) as MessageWithReasoning[]) as ReturnType<OpenAiModelUtils['processMessages']>;
         if (reasoningByToolCall.size === 0) {
             return result;
         }
@@ -145,6 +148,63 @@ export class CallistoOpenAiModelUtils extends OpenAiModelUtils {
         }
         return result;
     }
+}
+
+/**
+ * Tool call id → id of the first call of the model turn it was made in, for turns with several calls at once. Filled
+ * by the tool loop; kept for this backend's lifetime, oldest entries dropped first.
+ */
+const toolCallTurns = new Map<string, string>();
+const MAX_REMEMBERED_TOOL_CALLS = 20000;
+
+export function rememberToolCallTurn(ids: readonly string[]): void {
+    if (ids.length < 2) {
+        return;
+    }
+    for (const id of ids) {
+        toolCallTurns.set(id, ids[0]);
+    }
+    for (const oldest of toolCallTurns.keys()) {
+        if (toolCallTurns.size <= MAX_REMEMBERED_TOOL_CALLS) {
+            break;
+        }
+        toolCallTurns.delete(oldest);
+    }
+}
+
+/**
+ * Puts tool calls the model made together back into one assistant message, followed by their results, as the tool loop
+ * sent them. Theia's history has one tool call per assistant message (call, result, call, result …), so after a turn
+ * with several calls at once the prompt no longer matched LM Studio's cache from that turn on: after a turn that read
+ * six files, the next request re-read 16,500 of its 24,500 tokens. Turns this backend did not run are left as they are.
+ */
+export function regroupParallelToolCalls(messages: MessageWithReasoning[]): MessageWithReasoning[] {
+    const result: MessageWithReasoning[] = [];
+    for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        const first = message.role === 'assistant' && message.tool_calls?.length === 1 ? message.tool_calls[0].id : undefined;
+        if (!first || toolCallTurns.get(first) !== first) {
+            result.push(message);
+            continue;
+        }
+        const merged: MessageWithReasoning = { ...message, tool_calls: [...message.tool_calls!] };
+        const toolResults: MessageWithReasoning[] = [];
+        let next = i + 1;
+        for (; next < messages.length; next++) {
+            const candidate = messages[next] as MessageWithReasoning & { content?: unknown };
+            if (candidate.role === 'tool') {
+                toolResults.push(candidate);
+            } else if (candidate.role === 'assistant' && candidate.tool_calls?.length === 1 && !candidate.content
+                && toolCallTurns.get(candidate.tool_calls[0].id) === first) {
+                merged.tool_calls!.push(candidate.tool_calls[0]);
+            } else {
+                break;
+            }
+        }
+        result.push(merged, ...toolResults);
+        i = next - 1;
+    }
+    return result;
 }
 
 function isCarriedThinking(message: LanguageModelMessage): message is LanguageModelMessage & { type: 'thinking'; thinking: string } {

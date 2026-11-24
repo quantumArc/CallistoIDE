@@ -212,6 +212,41 @@ body .theia-thinking-preview {
     line-height: 1.4;
 }
 
+/* Callisto: where the agent summarized a long chat; click to read the summary. */
+.callisto-summary {
+    margin: calc(var(--theia-ui-padding) * 2) 0;
+    padding: calc(var(--theia-ui-padding) * 1.5) calc(var(--theia-ui-padding) * 2);
+    border-left: 3px solid var(--theia-textLink-foreground);
+    background: var(--theia-textBlockQuote-background);
+    color: var(--theia-foreground);
+    line-height: 1.4;
+}
+
+.callisto-summary > summary {
+    display: flex;
+    gap: calc(var(--theia-ui-padding) * 1.5);
+    align-items: flex-start;
+    cursor: pointer;
+    list-style: none;
+}
+
+.callisto-summary > summary::-webkit-details-marker {
+    display: none;
+}
+
+.callisto-summary > summary .codicon {
+    color: var(--theia-textLink-foreground);
+    margin-top: 1px;
+}
+
+.callisto-summary-text {
+    margin-top: calc(var(--theia-ui-padding) * 1.5);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
 .callisto-notice .codicon {
     color: var(--theia-editorWarning-foreground);
     margin-top: 1px;

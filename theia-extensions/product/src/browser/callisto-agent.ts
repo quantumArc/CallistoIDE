@@ -5,15 +5,17 @@
  ********************************************************************************/
 
 import { inject, injectable } from '@theia/core/shared/inversify';
-import { CancellationTokenSource, Disposable, PreferenceService } from '@theia/core';
+import { CancellationToken, CancellationTokenSource, Disposable, PreferenceService } from '@theia/core';
 import {
-    ChatModel, ChatMode, ChatRequestModel, ChatResponseContent, ErrorChatResponseContent, InformationalChatResponseContent,
-    InformationalChatResponseContentImpl, MutableChatRequestModel, ThinkingChatResponseContent, ToolCallChatResponseContent
+    ChatModel, ChatMode, ChatRequestModel, ChatResponseContent, ChatResponseModel, CompactionChatResponseContent,
+    CompactionChatResponseContentImpl, ErrorChatResponseContent, InformationalChatResponseContent, InformationalChatResponseContentImpl,
+    MutableChatRequestModel, ProgressChatResponseContent, ProgressChatResponseContentImpl, ResponseTokenUsage, ThinkingChatResponseContent,
+    ToolCallChatResponseContent
 } from '@theia/ai-chat/lib/common';
 import { ImageContextVariable } from '@theia/ai-chat/lib/common/image-context-variable';
 import {
-    isLanguageModelStreamResponse, isTextResponsePart, isThinkingResponsePart, isToolCallResponsePart, LanguageModel, LanguageModelMessage,
-    LanguageModelRequirement, LanguageModelResponse, LanguageModelStreamResponse, PromptVariantSet, ToolRequest
+    isLanguageModelStreamResponse, isLanguageModelTextResponse, isTextResponsePart, isThinkingResponsePart, isToolCallResponsePart, LanguageModel,
+    LanguageModelMessage, LanguageModelRequirement, LanguageModelResponse, LanguageModelStreamResponse, PromptVariantSet, ToolRequest
 } from '@theia/ai-core';
 import { AbstractModeAwareChatAgent } from '@theia/ai-ide/lib/browser/mode-aware-chat-agent';
 import { RUN_TASK_FUNCTION_ID } from '@theia/ai-ide/lib/common/workspace-functions';
@@ -32,9 +34,13 @@ import { CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from
 import { carriedThinking } from '../common/carried-thinking.js';
 import { commandFailed, describe, keptReasoning, NudgeContext, nudgeFor } from '../common/callisto-nudges.js';
 import { SyntaxCheckResult, SyntaxCheckService } from '../common/syntax-check-protocol.js';
-import { LOOP_BREAKER_PREF, MAX_THINKING_TOKENS_PREF } from './callisto-agent-preferences.js';
+import { LOOP_BREAKER_PREF, MAX_THINKING_TOKENS_PREF, SUMMARIZE_AFTER_TOKENS_PREF } from './callisto-agent-preferences.js';
 import { contextOverflowMessage, parseContextOverflow } from '../common/context-overflow.js';
 import { LM_STUDIO_PREFIX, LocalModelsContribution } from './local-models-contribution.js';
+import {
+    CALLISTO_SUMMARY_PROVIDER, CallistoSummaryData, changedFiles, cleanSummary, isCallistoSummaryData, MAX_SUMMARY_CHARS, parseTodos,
+    summarizeThreshold, summaryInstruction, summaryMessage, TodoItem
+} from '../common/conversation-summary.js';
 
 export const CALLISTO_AGENT_ID = 'Callisto';
 
@@ -72,6 +78,16 @@ const FULL_WRITE_TOOLS = new Set([WRITE_FILE_CONTENT_ID, SUGGEST_FILE_CONTENT_ID
 /** Tools that change a file on disk (Agent mode), after which Callisto checks that the file still parses. */
 const DISK_WRITE_TOOLS = new Set([WRITE_FILE_CONTENT_ID, WRITE_FILE_REPLACEMENTS_ID]);
 
+/** Tools whose `path` argument names a file the model created or changed, for the file list kept with a summary. */
+const FILE_CHANGE_TOOLS = new Set([WRITE_FILE_CONTENT_ID, WRITE_FILE_REPLACEMENTS_ID, SUGGEST_FILE_CONTENT_ID, SUGGEST_FILE_REPLACEMENTS_ID]);
+
+/** Room for a summary, reasoning included (LM Studio counts both against `max_tokens`). */
+const SUMMARY_MAX_TOKENS = 8192;
+/** Reasoning past this while writing a summary means the model is working on the task again instead: give up. */
+const MAX_SUMMARY_THINKING_CHARS = 40000;
+/** What a tool call gets while the model writes a summary. The tools stay declared so the prompt matches LM Studio's cache. */
+const TOOLS_OFF_WHILE_SUMMARIZING = 'Callisto: tools are switched off while you write the summary. Reply with the summary now.';
+
 /** Files that can be run or tested, for which the model is reminded to run them instead of re-reading them. */
 const CODE_FILE = /\.(m?js|cjs|jsx|tsx?|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|cs|php|sh)$/i;
 const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|[._-](test|spec)\.[a-z]+$/i;
@@ -99,6 +115,23 @@ interface LlmCall {
     isPromptVariantCustomized?: boolean;
     cancellation: CancellationTokenSource;
     cancellationLink: Disposable;
+}
+
+/** The prompt a summary is asked for in: the same system message, tools and model as the chat's requests. */
+interface SummaryCall {
+    system: LanguageModelMessage[];
+    tools: ToolRequest[];
+    deferredToolIds: string[] | undefined;
+    languageModel: LanguageModel;
+    /** Request whose session settings (thinking level, provider settings) apply. */
+    settingsFrom: MutableChatRequestModel;
+}
+
+/** A Callisto summary in a chat, and the index of the request it covers up to. */
+interface ChatSummary {
+    part: CompactionChatResponseContent;
+    data: CallistoSummaryData;
+    index: number;
 }
 
 /**
@@ -165,6 +198,10 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     protected readonly requestNotes = new Map<string, LanguageModelMessage[]>();
     /** The nudge sent after each interruption notice, replayed at the notice's place in later requests. */
     protected readonly nudges = new WeakMap<object, string>();
+    /** Summaries being written, by chat session id. */
+    protected readonly summarizing = new Map<string, Promise<boolean>>();
+    /** The request a chat's last failed summary was to cover up to: not tried again until the chat has moved on. */
+    protected readonly failedSummaries = new WeakMap<ChatModel, string>();
 
     /**
      * Replaces a server's raw "request exceeds the available context size" 400 with what happened and what to do,
@@ -202,6 +239,11 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         isPromptVariantCustomized?: boolean,
         options: { lowReasoningUntilAction?: boolean } = {}
     ): Promise<LanguageModelResponse> {
+        if (!this.llmCalls.has(request) && isLocalModel(languageModel)
+            && await this.summarizeBeforeRequest(request, messages, toolRequests, deferredToolIds, languageModel)) {
+            // The chat now starts with the summary: rebuild what this request sends.
+            messages = [...messages.filter(message => message.actor === 'system'), ...await this.getMessages(request.session)];
+        }
         const previous = this.llmCalls.get(request);
         previous?.cancellationLink.dispose();
         const cancellation = new CancellationTokenSource();
@@ -412,9 +454,22 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
      * - the nudge after an interruption is replayed where the interruption notice is.
      */
     protected override async getMessages(model: ChatModel, includeResponseInProgress = false): Promise<LanguageModelMessage[]> {
-        const requests = model.getRequests();
+        return this.historyMessages(model, model.getRequests(), includeResponseInProgress);
+    }
+
+    /**
+     * The messages for the given requests of a chat, as {@link getMessages} describes; when a Callisto summary covers some
+     * of them, the summary stands in for those.
+     */
+    protected async historyMessages(
+        model: ChatModel, requests: readonly ChatRequestModel[], includeResponseInProgress = false
+    ): Promise<LanguageModelMessage[]> {
         const messages: LanguageModelMessage[] = [];
-        for (const request of requests) {
+        const summary = latestSummary(requests);
+        if (summary) {
+            messages.push({ actor: 'user', type: 'text', text: summaryMessage(summary.part.summary ?? '', summary.data) });
+        }
+        for (const request of requests.slice(summary ? summary.index + 1 : 0)) {
             const text = request.message.parts.map(part => part.promptText).join('');
             if (text.length > 0) {
                 messages.push({ actor: 'user', type: 'text', text });
@@ -467,7 +522,8 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                 }
                 continue;
             }
-            if (ErrorChatResponseContent.is(part)) {
+            if (ErrorChatResponseContent.is(part) || ProgressChatResponseContent.is(part) || isCallistoSummary(part)) {
+                // Errors and progress are for the user only; a summary is sent in place of what it covers (historyMessages).
                 continue;
             }
             if (ThinkingChatResponseContent.is(part)) {
@@ -509,6 +565,161 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     /** Whether the model has written a todo list in this task. */
     protected hasTodoList(request: MutableChatRequestModel): boolean {
         return request.response.response.content.some(part => ToolCallChatResponseContent.is(part) && part.name === TODO_WRITE_FUNCTION_ID);
+    }
+
+    // ---------------------------------------------------------------- summaries of long chats
+
+    /**
+     * Once a chat with a local model is long, summarizes it right after the model's reply, while LM Studio still holds
+     * the whole chat in its prompt cache: the summary request is that same prompt plus one instruction, so only the
+     * instruction and the summary itself are new work. Without this, the next message after LM Studio restarts or unloads
+     * the model (an idle hour, by default) re-reads the whole chat, which took over 6 minutes for 65k tokens.
+     */
+    protected override async onResponseComplete(request: MutableChatRequestModel): Promise<void> {
+        await super.onResponseComplete(request);
+        const call = this.llmCalls.get(request);
+        const requests = request.session.getRequests();
+        if (!call || !isLocalModel(call.languageModel) || request.response.isError || requests[requests.length - 1] !== request
+            || this.summarizing.has(request.session.id) || !this.needsSummary(request.session, requests, call.languageModel)) {
+            return;
+        }
+        const session = request.session;
+        const system = call.messages.filter(message => message.actor === 'system');
+        const job = this.summarize(session, requests, {
+            system, tools: call.tools, deferredToolIds: call.deferredToolIds, languageModel: call.languageModel, settingsFrom: request
+        }, CancellationToken.None).finally(() => this.summarizing.delete(session.id));
+        this.summarizing.set(session.id, job);
+    }
+
+    /**
+     * Before the first model call of a request: waits for a summary still being written, or writes one now if the chat
+     * before this request is long and has none (a chat from before a restart, or one whose last reply ended in an error).
+     * @returns whether the chat now has a newer summary, so that the request's messages have to be rebuilt.
+     */
+    protected async summarizeBeforeRequest(
+        request: MutableChatRequestModel, messages: LanguageModelMessage[], tools: ToolRequest[], deferredToolIds: string[] | undefined,
+        languageModel: LanguageModel
+    ): Promise<boolean> {
+        const session = request.session;
+        const all = session.getRequests();
+        const earlier = all.slice(0, Math.max(0, all.indexOf(request)));
+        const before = latestSummary(earlier)?.part;
+        const token = request.response.cancellationToken;
+        let progress: ChatResponseContent | undefined;
+        const showProgress = (message: string): void => {
+            if (!progress) {
+                progress = new ProgressChatResponseContentImpl(message);
+                request.response.response.addContent(progress);
+            }
+        };
+        try {
+            const pending = this.summarizing.get(session.id);
+            if (pending) {
+                showProgress('Callisto is finishing its summary of the earlier conversation…');
+                await Promise.race([pending, whenCancelled(token)]);
+            }
+            if (!token.isCancellationRequested && earlier.length > 0 && this.needsSummary(session, earlier, languageModel)) {
+                const tokens = unsummarizedTokens(earlier);
+                showProgress(`Callisto is summarizing the earlier conversation${tokens ? ` (${tokens.toLocaleString('en-US')} tokens)` : ''}, `
+                    + 'so that this request and the next ones start short…');
+                await this.summarize(session, earlier, {
+                    system: messages.filter(message => message.actor === 'system'), tools, deferredToolIds, languageModel, settingsFrom: request
+                }, token);
+            }
+        } finally {
+            if (progress) {
+                removeContent(request, progress);
+            }
+        }
+        return latestSummary(earlier)?.part !== before;
+    }
+
+    /** Whether the part of the chat no summary covers yet is past the size from which Callisto summarizes. */
+    protected needsSummary(session: ChatModel, requests: readonly ChatRequestModel[], languageModel: LanguageModel): boolean {
+        const threshold = summarizeThreshold(
+            this.preferences.get<number>(SUMMARIZE_AFTER_TOKENS_PREF), this.localModels.getLmStudioInfo(languageModel.id)?.context?.loaded);
+        const tokens = unsummarizedTokens(requests);
+        const last = requests[requests.length - 1];
+        return threshold !== undefined && tokens !== undefined && tokens >= threshold && !!last && this.failedSummaries.get(session) !== last.id;
+    }
+
+    /**
+     * Asks the model for a summary of the given requests (the chat up to and including the last of them) and stores it
+     * in the last one's response. The prompt is the chat exactly as the agent sends it, same system message and tools,
+     * plus an instruction at the end, so LM Studio reuses its cache for all but the instruction. Tool calls are answered
+     * with "write the summary", and the files changed and the todo list are taken from the tool calls, not the model.
+     * @returns whether a summary was stored. On failure the chat goes on unsummarized.
+     */
+    protected async summarize(session: ChatModel, covered: readonly ChatRequestModel[], call: SummaryCall, token: CancellationToken): Promise<boolean> {
+        const last = covered[covered.length - 1] as MutableChatRequestModel | undefined;
+        if (!last) {
+            return false;
+        }
+        const earlier = latestSummary(covered);
+        const tokensBefore = unsummarizedTokens(covered);
+        const started = Date.now();
+        const source = new CancellationTokenSource();
+        const link = token.onCancellationRequested(() => source.cancel());
+        try {
+            let messages: LanguageModelMessage[] = [
+                ...call.system,
+                ...await this.historyMessages(session, covered),
+                { actor: 'user', type: 'text', text: summaryInstruction(!!earlier) }
+            ];
+            if (!carriesReasoning(call.languageModel)) {
+                messages = messages.filter(message => !isCarriedThinking(message));
+            }
+            const tools = this.deduplicateTools(call.tools.map(tool => ({ ...tool, handler: async () => TOOLS_OFF_WHILE_SUMMARIZING })));
+            const { commonSettings, providerSettings } = this.getSessionSettings(call.settingsFrom);
+            const settings: Record<string, unknown> = { ...this.getLlmSettings(), ...providerSettings };
+            if (call.languageModel.id.startsWith(LM_STUDIO_PREFIX)) {
+                settings.max_tokens = SUMMARY_MAX_TOKENS;
+            }
+            if (supportsLowReasoning(call.languageModel)) {
+                // The backend sends 'low' for this request (it never acts, so the level is not put back).
+                settings[LOW_REASONING_UNTIL_ACTION_SETTING] = true;
+            }
+            const response = await this.languageModelService.sendRequest(call.languageModel, {
+                messages,
+                tools: tools.length > 0 ? tools : undefined,
+                deferredToolIds: call.deferredToolIds,
+                settings,
+                reasoning: commonSettings?.reasoning,
+                agentId: this.id,
+                sessionId: session.id,
+                requestId: last.id,
+                subRequestId: `${last.id}.callisto-summary`,
+                cancellationToken: source.token
+            });
+            const summary = cleanSummary(await readSummaryReply(response, source));
+            if (!summary || token.isCancellationRequested) {
+                if (!token.isCancellationRequested) {
+                    this.failedSummaries.set(session, last.id);
+                    this.logger.warn('Callisto: the model did not write a usable summary; the chat goes on unsummarized.');
+                }
+                return false;
+            }
+            const since = covered.slice(earlier ? earlier.index + 1 : 0);
+            const data: CallistoSummaryData = {
+                version: 1,
+                coveredRequestId: last.id,
+                tokensBefore,
+                files: changedFiles(fileChangeArguments(since), earlier?.data.files),
+                todos: latestTodos(since) ?? earlier?.data.todos
+            };
+            last.response.response.addContent(new CompactionChatResponseContentImpl(CALLISTO_SUMMARY_PROVIDER, data, summary));
+            this.logger.info(`Callisto: summarized ${covered.length} requests (${tokensBefore ?? '?'} tokens) in ${Math.round((Date.now() - started) / 1000)} s.`);
+            return true;
+        } catch (error) {
+            if (!token.isCancellationRequested) {
+                this.failedSummaries.set(session, last.id);
+                this.logger.warn('Callisto: summarizing the chat failed; it goes on unsummarized.', error);
+            }
+            return false;
+        } finally {
+            link.dispose();
+            source.dispose();
+        }
     }
 
     // ---------------------------------------------------------------- loop guard on tool calls
@@ -618,6 +829,127 @@ function carriesReasoning(languageModel: LanguageModel): boolean {
  */
 function supportsLowReasoning(languageModel: LanguageModel | undefined): boolean {
     return !!languageModel && carriesReasoning(languageModel) && !!languageModel.reasoningSupport?.supportedLevels.includes('low');
+}
+
+/** Models served on this machine (LM Studio, Ollama), where a long chat costs minutes to read again. */
+function isLocalModel(languageModel: LanguageModel): boolean {
+    return languageModel.id.startsWith(LM_STUDIO_PREFIX) || languageModel.id.startsWith('ollama/');
+}
+
+function isCallistoSummary(part: ChatResponseContent): part is CompactionChatResponseContent {
+    return CompactionChatResponseContent.is(part) && part.provider === CALLISTO_SUMMARY_PROVIDER;
+}
+
+/** The latest Callisto summary among the given requests: the one in the response of the request it covers up to. */
+function latestSummary(requests: readonly ChatRequestModel[]): ChatSummary | undefined {
+    for (let index = requests.length - 1; index >= 0; index--) {
+        const content = requests[index].response.response.content;
+        for (let i = content.length - 1; i >= 0; i--) {
+            const part = content[i];
+            if (isCallistoSummary(part) && isCallistoSummaryData(part.data) && part.data.coveredRequestId === requests[index].id) {
+                return { part, data: part.data, index };
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Tokens of the part of the chat no summary covers yet: what the latest model call after the latest summary read plus
+ * wrote, which is what the next call starts from. Undefined when no call after the summary reported its usage.
+ */
+function unsummarizedTokens(requests: readonly ChatRequestModel[]): number | undefined {
+    const summary = latestSummary(requests);
+    for (let index = requests.length - 1; index > (summary?.index ?? -1); index--) {
+        const usage = latestUsage(requests[index].response);
+        if (usage && usage.inputTokens > 0) {
+            return usage.inputTokens + usage.outputTokens;
+        }
+    }
+    return undefined;
+}
+
+/** Usage of the response's latest model call. Theia keeps every call's usage, but its interface exposes only the latest. */
+function latestUsage(response: ChatResponseModel): ResponseTokenUsage | undefined {
+    const entries = (response as { tokenUsageEntries?: readonly ResponseTokenUsage[] }).tokenUsageEntries;
+    return entries?.[entries.length - 1] ?? response.tokenUsage;
+}
+
+/** Arguments of every call that changed a file, in order. */
+function fileChangeArguments(requests: readonly ChatRequestModel[]): string[] {
+    return requests.flatMap(request => request.response.response.content
+        .filter(part => ToolCallChatResponseContent.is(part) && FILE_CHANGE_TOOLS.has(part.name ?? '') && !!part.arguments)
+        .map(part => (part as ToolCallChatResponseContent).arguments as string));
+}
+
+/** The model's latest todo list in the given requests. */
+function latestTodos(requests: readonly ChatRequestModel[]): TodoItem[] | undefined {
+    for (let index = requests.length - 1; index >= 0; index--) {
+        const content = requests[index].response.response.content;
+        for (let i = content.length - 1; i >= 0; i--) {
+            const part = content[i];
+            if (ToolCallChatResponseContent.is(part) && part.name === TODO_WRITE_FUNCTION_ID) {
+                const todos = parseTodos(part.arguments);
+                if (todos) {
+                    return todos;
+                }
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * The text of the model's reply to the summary instruction. Gives up (empty text) when the model reasons far longer
+ * than a summary needs, which means it went back to the task, and stops reading once there is more than a summary.
+ */
+async function readSummaryReply(response: LanguageModelResponse, source: CancellationTokenSource): Promise<string> {
+    if (isLanguageModelTextResponse(response)) {
+        return response.text;
+    }
+    if (!isLanguageModelStreamResponse(response)) {
+        return '';
+    }
+    let text = '';
+    let thinking = 0;
+    for await (const part of response.stream) {
+        if (isThinkingResponsePart(part)) {
+            thinking += part.thought.length;
+            if (thinking > MAX_SUMMARY_THINKING_CHARS) {
+                source.cancel();
+                return '';
+            }
+        } else if (isTextResponsePart(part)) {
+            text += part.content;
+            if (text.length > MAX_SUMMARY_CHARS * 2) {
+                source.cancel();
+                break;
+            }
+        }
+    }
+    return text;
+}
+
+function whenCancelled(token: CancellationToken): Promise<void> {
+    return new Promise(resolve => {
+        if (token.isCancellationRequested) {
+            resolve();
+        } else {
+            token.onCancellationRequested(() => resolve());
+        }
+    });
+}
+
+/** Takes one part out of a response (the response has no API for that). */
+function removeContent(request: MutableChatRequestModel, part: ChatResponseContent): void {
+    const response = request.response.response;
+    const rest = response.content.filter(other => other !== part);
+    if (rest.length !== response.content.length) {
+        response.clearContent();
+        if (rest.length > 0) {
+            response.addContents(rest);
+        }
+    }
 }
 
 /** The request's images, as Theia's own history adds them. */

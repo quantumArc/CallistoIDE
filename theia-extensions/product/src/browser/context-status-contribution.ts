@@ -9,7 +9,8 @@ import { DisposableCollection } from '@theia/core';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser';
 import { StatusBar, StatusBarAlignment } from '@theia/core/lib/browser/status-bar/status-bar';
 import { ChatService } from '@theia/ai-chat/lib/common/chat-service';
-import { ChatResponseModel, ResponseTokenUsage } from '@theia/ai-chat/lib/common/chat-model';
+import { ChatResponseModel, CompactionChatResponseContent, ResponseTokenUsage } from '@theia/ai-chat/lib/common/chat-model';
+import { CALLISTO_SUMMARY_PROVIDER, isCallistoSummaryData } from '../common/conversation-summary.js';
 import { contextStatus } from '../common/context-status.js';
 import { AiRunStatsService } from './ai-run-stats.js';
 import { LocalModelsContribution, REFRESH_LOCAL_MODELS } from './local-models-contribution.js';
@@ -36,14 +37,29 @@ export class ContextStatusContribution implements FrontendApplicationContributio
     protected readonly localModels: LocalModelsContribution;
 
     protected readonly toDispose = new DisposableCollection();
+    /** Listens to the active chat, which changes on its own when Callisto adds a summary after a reply. */
+    protected readonly activeSessionListener = new DisposableCollection();
 
     onStart(): void {
         this.toDispose.pushAll([
-            this.chatService.onSessionEvent(() => this.update()),
+            this.activeSessionListener,
+            this.chatService.onSessionEvent(() => {
+                this.watchActiveSession();
+                this.update();
+            }),
             this.runStats.onDidChange(() => this.update()),
             this.localModels.onDidChangeLmStudioInfo(() => this.update())
         ]);
+        this.watchActiveSession();
         this.update();
+    }
+
+    protected watchActiveSession(): void {
+        this.activeSessionListener.dispose();
+        const model = this.chatService.getActiveSession()?.model;
+        if (model) {
+            this.activeSessionListener.push(model.onDidChange(() => this.update()));
+        }
     }
 
     onStop(): void {
@@ -54,6 +70,18 @@ export class ContextStatusContribution implements FrontendApplicationContributio
         const latest = this.latestUsage();
         if (!latest) {
             this.statusBar.removeElement(STATUS_BAR_ID);
+            return;
+        }
+        if (latest.summarizedFrom !== undefined) {
+            const from = latest.summarizedFrom ? ` at ${latest.summarizedFrom.toLocaleString('en-US')} tokens` : '';
+            this.statusBar.setElement(STATUS_BAR_ID, {
+                text: '$(fold) ctx summarized',
+                tooltip: `Callisto summarized this chat${from}. The next request sends the summary instead of the messages it covers, `
+                    + 'and this shows its exact size once it has run.',
+                alignment: StatusBarAlignment.LEFT,
+                priority: 99,
+                command: REFRESH_LOCAL_MODELS.id
+            });
             return;
         }
         const info = this.localModels.getLmStudioInfo(latest.model);
@@ -76,11 +104,19 @@ export class ContextStatusContribution implements FrontendApplicationContributio
         });
     }
 
-    /** The token usage of the active chat's most recent model call, and the model that made it. */
-    protected latestUsage(): { usage: ResponseTokenUsage; model?: string } | undefined {
+    /**
+     * The token usage of the active chat's most recent model call, and the model that made it; or, when Callisto has
+     * summarized the chat since, the size the chat had then (`summarizedFrom`, 0 when unknown).
+     */
+    protected latestUsage(): { usage: ResponseTokenUsage; model?: string; summarizedFrom?: number } | undefined {
         const requests = this.chatService.getActiveSession()?.model.getRequests() ?? [];
         for (let i = requests.length - 1; i >= 0; i--) {
             const response = requests[i].response;
+            const summary = response.response.content.find(part => CompactionChatResponseContent.is(part) && part.provider === CALLISTO_SUMMARY_PROVIDER);
+            if (summary && CompactionChatResponseContent.is(summary)) {
+                const tokensBefore = isCallistoSummaryData(summary.data) ? summary.data.tokensBefore : undefined;
+                return { usage: { inputTokens: 0, outputTokens: 0 }, model: response.languageModel, summarizedFrom: tokensBefore ?? 0 };
+            }
             const entries = usageEntries(response);
             const last = entries[entries.length - 1];
             if (last && last.inputTokens > 0) {

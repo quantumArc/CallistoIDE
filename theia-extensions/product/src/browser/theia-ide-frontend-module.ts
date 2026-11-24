@@ -32,6 +32,7 @@ import { Agent } from '@theia/ai-core/lib/common';
 import { ChatAgent } from '@theia/ai-chat/lib/common';
 import { CallistoThinkingPartRenderer } from './callisto-thinking-part-renderer.js';
 import { CallistoNoticeRenderer } from './callisto-notice-renderer.js';
+import { CallistoSummaryRenderer } from './callisto-summary-renderer.js';
 import { ChatResponsePartRenderer } from '@theia/ai-chat-ui/lib/browser/chat-response-part-renderer';
 import { LocalModelsPreferencesSchema } from './local-models-preferences.js';
 import { LOCAL_MODEL_DISCOVERY_PATH, LocalModelDiscoveryService } from '../common/local-models-protocol.js';
@@ -82,6 +83,8 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(ChatResponsePartRenderer).toService(CallistoThinkingPartRenderer);
     bind(CallistoNoticeRenderer).toSelf().inSingletonScope();
     bind(ChatResponsePartRenderer).toService(CallistoNoticeRenderer);
+    bind(CallistoSummaryRenderer).toSelf().inSingletonScope();
+    bind(ChatResponsePartRenderer).toService(CallistoSummaryRenderer);
 
     // Callisto's own coding agent, tuned for local models.
     bind(PreferenceContribution).toConstantValue({ schema: CallistoAgentPreferencesSchema });
