@@ -109,8 +109,10 @@ Create `tasks/<id>/` with:
 - `task.json`: `title`, `turns` (each with a `message`, starting the first with `@Callisto`; optional `timeoutMinutes`,
   default 15; optional `waitForSummary`), and optional `settings` merged into the scratch `settings.json`;
 - `fixture/`: the starting project (optional);
-- `check.mjs`: `export default async function check({ workspace, fixtureDir, answers, turnResults })` returning
-  `{ pass, notes }`. `harness/check-utils.mjs` has helpers for running tests and comparing files.
+- `check.mjs`: `export default async function check({ workspace, fixtureDir, answers, turnResults, chat })` returning
+  `{ pass, notes }`, where `chat` is the saved chat session (tool calls and their results included).
+  `harness/check-utils.mjs` has helpers for running tests and comparing files.
+- `requires` in `task.json` (optional): `["searxng"]` skips the task when SearXNG is not running.
 
 Make the check pass a reference solution and fail the untouched fixture before relying on it.
 

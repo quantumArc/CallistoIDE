@@ -15,7 +15,7 @@ import * as lmLog from './harness/lmstudio-log.mjs';
 import { formatLine, markdownTable } from './harness/report.mjs';
 import { latestSession, turns, answerText, responseStats } from './harness/chat.mjs';
 import {
-    REPO, openBrowser, openChat, sendMessage, startServer, stopResponse, stopServer, waitForResponse, waitForSummary
+    REPO, openBrowser, openChat, sendMessage, startServer, stopResponse, stopServer, waitForPortFree, waitForResponse, waitForSummary
 } from './harness/app.mjs';
 
 const EVALS = join(REPO, 'evals');
@@ -121,7 +121,7 @@ async function runTask(id, browser, { workRoot, resultsDir }) {
     const answers = result.turns.map(turn => turn.answer);
     try {
         const { default: check } = await import(pathToFileURL(join(taskDir, 'check.mjs')).href);
-        const verdict = await check({ workspace, fixtureDir, answers, turnResults: result.turns });
+        const verdict = await check({ workspace, fixtureDir, answers, turnResults: result.turns, chat: session?.data });
         result.pass = verdict.pass && !result.notes.some(note => note.startsWith('harness error'));
         result.notes.push(...verdict.notes);
     } catch (error) {
@@ -210,13 +210,9 @@ async function preflight() {
     if (!existsSync(join(REPO, 'applications', 'browser', 'lib', 'backend', 'main.js'))) {
         fail('The browser build is missing. Build it first: yarn --cwd applications/browser build (see evals/README.md).');
     }
-    try {
-        const response = await fetch(`http://127.0.0.1:${port}/`);
-        if (response) {
-            fail(`Port ${port} is already in use. Stop whatever runs there, or pass --port.`);
-        }
-    } catch {
-        // Free.
+    // A run started right after another finds its server still shutting down for a few seconds.
+    if (!await waitForPortFree(port, 20_000)) {
+        fail(`Port ${port} is already in use. Stop whatever runs there, or pass --port.`);
     }
     let models;
     try {
