@@ -14,6 +14,9 @@ import { CallistoChatCompletionStream, CallistoOpenAiModelUtils } from './callis
 import { SYNTAX_CHECK_PATH, SyntaxCheckService } from '../common/syntax-check-protocol.js';
 import { SyntaxCheckServiceImpl } from './syntax-check-service.js';
 import { installLocalModelTimeouts } from './local-model-timeouts.js';
+import { BackendApplicationContribution } from '@theia/core/lib/node';
+import { WEB_SEARCH_PATH, WebSearchService } from '../common/web-search-protocol.js';
+import { WebSearchServiceImpl } from './web-search-service.js';
 
 // Long prompts on a local model take minutes before the first byte; do not let fetch give up after 5 (see the function).
 installLocalModelTimeouts();
@@ -23,6 +26,14 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(LocalModelDiscoveryService).toService(LocalModelDiscoveryServiceImpl);
     bind(ConnectionHandler).toDynamicValue(ctx =>
         new RpcConnectionHandler(LOCAL_MODEL_DISCOVERY_PATH, () => ctx.container.get(LocalModelDiscoveryService))
+    ).inSingletonScope();
+
+    bind(WebSearchServiceImpl).toSelf().inSingletonScope();
+    bind(WebSearchService).toService(WebSearchServiceImpl);
+    // Stops the SearXNG it started when Callisto exits.
+    bind(BackendApplicationContribution).toService(WebSearchServiceImpl);
+    bind(ConnectionHandler).toDynamicValue(ctx =>
+        new RpcConnectionHandler(WEB_SEARCH_PATH, () => ctx.container.get(WebSearchService))
     ).inSingletonScope();
 
     bind(SyntaxCheckServiceImpl).toSelf().inSingletonScope();

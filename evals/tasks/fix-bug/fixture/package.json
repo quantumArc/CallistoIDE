@@ -1,0 +1,7 @@
+{
+    "name": "stats",
+    "private": true,
+    "scripts": {
+        "test": "node --test"
+    }
+}

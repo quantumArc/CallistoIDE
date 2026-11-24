@@ -1,0 +1,7 @@
+{
+    "name": "todo-store",
+    "private": true,
+    "scripts": {
+        "test": "node --test"
+    }
+}

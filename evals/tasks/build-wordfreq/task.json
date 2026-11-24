@@ -1,0 +1,9 @@
+{
+    "title": "Write a small module and command-line tool from scratch",
+    "turns": [
+        {
+            "message": "@Callisto Create wordfreq.js in the project root as a CommonJS module. It must export topWords(text, n), which returns the n most frequent words as an array of [word, count] pairs, sorted by count (highest first) and then alphabetically. A word is a run of the letters a-z and apostrophes, compared in lower case. Running `node wordfreq.js sample.txt 3` must print the top 3 words of that file, one per line, as `word count`. Requiring the file must not run the command-line part. Try it on sample.txt.",
+            "timeoutMinutes": 20
+        }
+    ]
+}

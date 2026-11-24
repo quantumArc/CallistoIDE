@@ -1,0 +1,7 @@
+{
+    "name": "geometry",
+    "private": true,
+    "scripts": {
+        "test": "node --test"
+    }
+}

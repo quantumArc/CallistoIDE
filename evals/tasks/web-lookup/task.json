@@ -1,0 +1,10 @@
+{
+    "title": "Look something up on the web and read the source",
+    "requires": ["searxng"],
+    "turns": [
+        {
+            "message": "@Callisto Look this up on the web and read the documentation page itself: in SearXNG's search API, which URL parameter chooses the output format, and which output formats does the documentation list? Answer in two short sentences and name the page you used.",
+            "timeoutMinutes": 10
+        }
+    ]
+}

@@ -1,0 +1,17 @@
+{
+    "title": "Long chat: summary after a big read, then a follow-up that needs the earlier answer",
+    "settings": {
+        "callisto.agent.summarizeAfterTokens": 16000
+    },
+    "turns": [
+        {
+            "message": "@Callisto Read every file in this project (README.md, index.html, style.css, app.js, js/engine.js, js/ai.js), then explain in a short paragraph how the AI chooses its move. Do not change any files.",
+            "timeoutMinutes": 15,
+            "waitForSummary": true
+        },
+        {
+            "message": "Which file defines the material values of the pieces, and what is a queen worth there? Answer in one sentence from what you already know; do not read files again.",
+            "timeoutMinutes": 10
+        }
+    ]
+}

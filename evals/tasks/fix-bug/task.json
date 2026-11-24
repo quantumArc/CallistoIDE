@@ -1,0 +1,9 @@
+{
+    "title": "Find and fix a bug that a test exposes",
+    "turns": [
+        {
+            "message": "@Callisto The tests in this project fail. Find the bug in the source code and fix it; do not change the tests. Run the tests to confirm that they pass.",
+            "timeoutMinutes": 15
+        }
+    ]
+}

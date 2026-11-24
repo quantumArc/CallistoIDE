@@ -1,0 +1,9 @@
+{
+    "title": "Rename a function across several files",
+    "turns": [
+        {
+            "message": "@Callisto Rename the function areaOfCircle to circleArea everywhere in this project: its definition, its export, every caller and the tests. Then run the tests.",
+            "timeoutMinutes": 15
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+{
+    "title": "Add a method to an existing module, with tests",
+    "turns": [
+        {
+            "message": "@Callisto Add a remove(id) method to the store in src/todo.js: it deletes the item with that id and returns true, or returns false if there is no such item. Add tests for it to test/todo.test.js, and run the tests.",
+            "timeoutMinutes": 15
+        }
+    ]
+}

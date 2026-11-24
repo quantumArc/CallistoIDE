@@ -28,6 +28,9 @@ import { ContextStatusContribution } from './context-status-contribution.js';
 import { CallistoAgent } from './callisto-agent.js';
 import { CallistoAgentPreferencesSchema } from './callisto-agent-preferences.js';
 import { SYNTAX_CHECK_PATH, SyntaxCheckService } from '../common/syntax-check-protocol.js';
+import { WEB_SEARCH_PATH, WebSearchService } from '../common/web-search-protocol.js';
+import { FetchWebPageTool, WebSearchTool } from './web-search-tools.js';
+import { bindToolProvider } from '@theia/ai-core/lib/common';
 import { Agent } from '@theia/ai-core/lib/common';
 import { ChatAgent } from '@theia/ai-chat/lib/common';
 import { CallistoThinkingPartRenderer } from './callisto-thinking-part-renderer.js';
@@ -88,6 +91,11 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
 
     // Callisto's own coding agent, tuned for local models.
     bind(PreferenceContribution).toConstantValue({ schema: CallistoAgentPreferencesSchema });
+    bind(WebSearchService).toDynamicValue(ctx =>
+        ctx.container.get<ServiceConnectionProvider>(RemoteConnectionProvider).createProxy<WebSearchService>(WEB_SEARCH_PATH)
+    ).inSingletonScope();
+    bindToolProvider(WebSearchTool, bind);
+    bindToolProvider(FetchWebPageTool, bind);
     bind(SyntaxCheckService).toDynamicValue(ctx =>
         ctx.container.get<ServiceConnectionProvider>(RemoteConnectionProvider).createProxy<SyntaxCheckService>(SYNTAX_CHECK_PATH)
     ).inSingletonScope();

@@ -1,0 +1,9 @@
+{
+    "title": "Read three files in one step and compare their exports",
+    "turns": [
+        {
+            "message": "@Callisto Read src/a.js, src/b.js and src/c.js. Which function names are exported (through module.exports) by more than one of these three files? Reply with one line: just those names, comma-separated, in alphabetical order. Do not change any files.",
+            "timeoutMinutes": 10
+        }
+    ]
+}

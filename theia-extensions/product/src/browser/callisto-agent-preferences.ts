@@ -11,6 +11,9 @@ import { DEFAULT_SUMMARIZE_AFTER_TOKENS, MIN_SUMMARIZE_AFTER_TOKENS } from '../c
 export const LOOP_BREAKER_PREF = 'callisto.agent.loopBreaker';
 export const MAX_THINKING_TOKENS_PREF = 'callisto.agent.maxThinkingTokens';
 export const SUMMARIZE_AFTER_TOKENS_PREF = 'callisto.agent.summarizeAfterTokens';
+export const WEB_SEARCH_ENABLED_PREF = 'callisto.webSearch.enabled';
+export const WEB_SEARCH_URL_PREF = 'callisto.webSearch.searxngUrl';
+export const WEB_SEARCH_CONTROL_SCRIPT_PREF = 'callisto.webSearch.controlScript';
 
 export const CallistoAgentPreferencesSchema: PreferenceSchema = {
     properties: {
@@ -43,6 +46,31 @@ export const CallistoAgentPreferencesSchema: PreferenceSchema = {
                 + 'The summary is written right after the model\'s reply, while the chat is still cached, so it is quick; the chat itself stays '
                 + 'visible. Callisto summarizes by half of the context the model is loaded with at the latest, and never below '
                 + `${MIN_SUMMARIZE_AFTER_TOKENS.toLocaleString('en-US')} tokens. \`0\` turns summaries off.`
+        },
+        [WEB_SEARCH_ENABLED_PREF]: {
+            type: 'boolean',
+            title: AI_CORE_PREFERENCES_TITLE,
+            default: true,
+            markdownDescription: 'Let the Callisto agent search the web (`webSearch`) and read web pages (`fetchWebPage`) through your own '
+                + '[SearXNG](https://docs.searxng.org/), a metasearch engine that runs on this Mac: no account, and your searches are not '
+                + 'tied to you. Setting it up is described in `docs/web-search.md`. Each search and page read asks for your confirmation '
+                + 'unless you set the tool to "Always allow".'
+        },
+        [WEB_SEARCH_URL_PREF]: {
+            type: 'string',
+            title: AI_CORE_PREFERENCES_TITLE,
+            default: 'http://127.0.0.1:8888',
+            markdownDescription: 'Address of the SearXNG the agent searches through. It must have the JSON format enabled '
+                + '(`search.formats` in its `settings.yml`).'
+        },
+        [WEB_SEARCH_CONTROL_SCRIPT_PREF]: {
+            type: 'string',
+            title: AI_CORE_PREFERENCES_TITLE,
+            default: '',
+            markdownDescription: 'A script that starts and stops your SearXNG when called with `start` or `stop`, such as '
+                + '`~/Documents/searxng/local/searxng.sh`. When the agent searches and nothing answers at `#callisto.webSearch.searxngUrl#`, '
+                + 'Callisto runs `<script> start`, and `<script> stop` when Callisto exits; a SearXNG you started yourself is left running. '
+                + 'Empty: Callisto never starts SearXNG, and the agent tells you when it is not running.'
         }
     }
 };
