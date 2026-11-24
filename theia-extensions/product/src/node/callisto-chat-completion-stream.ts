@@ -5,10 +5,11 @@
  ********************************************************************************/
 
 import { injectable } from '@theia/core/shared/inversify';
-import { isThinkingResponsePart, LanguageModelMessage, LanguageModelStreamResponsePart } from '@theia/ai-core';
+import { isTextResponsePart, isThinkingResponsePart, LanguageModelMessage, LanguageModelStreamResponsePart } from '@theia/ai-core';
 import { ChatCompletionStreamingAsyncIterator } from '@theia/ai-openai/lib/node/openai-chat-completion-stream';
 import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-model-utils';
 import { budgetReasoning, CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from '../common/reasoning-text.js';
+import { ThinkTagPart, ThinkTagSplitter, withoutThinkBlocks } from '../common/think-tags.js';
 
 /** The field LM Studio, llama.cpp, vLLM and DeepSeek use for reasoning, in streamed deltas and in input messages alike. */
 const REASONING_FIELD = 'reasoning_content';
@@ -62,16 +63,56 @@ export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIt
         super.init();
     }
 
+    /** Splits `<think>` blocks the model writes into its answer off into reasoning (see think-tags.ts). */
+    protected answerTags = new ThinkTagSplitter();
+    /** Drops the same tags from the reasoning channel; a tag can be split across chunks there too. */
+    protected reasoningTags = new ThinkTagSplitter();
+
     protected override handleIncoming(message: LanguageModelStreamResponsePart): void {
-        if (isThinkingResponsePart(message)) {
-            this.turnReasoning += message.thought;
+        if (isTextResponsePart(message)) {
+            this.emitSplit(this.answerTags.push(message.content));
+            return;
         }
+        if (isThinkingResponsePart(message)) {
+            this.emitThought(this.reasoningTags.push(message.thought).map(part => part.text).join(''), message.signature);
+            return;
+        }
+        // A tool call or the usage comes after any text held back for a possible tag.
+        this.flushTags();
         super.handleIncoming(message);
     }
 
-    protected override processStream(): ReturnType<ChatCompletionStreamingAsyncIterator['processStream']> {
+    protected emitSplit(parts: ThinkTagPart[]): void {
+        for (const part of parts) {
+            if (part.kind === 'thought') {
+                this.emitThought(part.text, '');
+            } else {
+                super.handleIncoming({ content: part.text });
+            }
+        }
+    }
+
+    protected emitThought(thought: string, signature: string | undefined): void {
+        if (thought) {
+            this.turnReasoning += thought;
+            super.handleIncoming({ thought, signature: signature ?? '' });
+        }
+    }
+
+    protected flushTags(): void {
+        this.emitSplit(this.answerTags.flush());
+        this.emitThought(this.reasoningTags.flush().map(part => part.text).join(''), '');
+    }
+
+    protected override async processStream(): ReturnType<ChatCompletionStreamingAsyncIterator['processStream']> {
         this.turnReasoning = '';
-        return super.processStream();
+        this.answerTags = new ThinkTagSplitter();
+        this.reasoningTags = new ThinkTagSplitter();
+        const result = await super.processStream();
+        this.flushTags();
+        // The next tool step sees the answer as the chat keeps it, without the `<think>` block, which is in the
+        // reasoning; CallistoOpenAiModelUtils rebuilds later requests the same way.
+        return { ...result, assistantText: withoutThinkBlocks(result.assistantText) };
     }
 
     protected override async executeAndAppendToolCalls(...args: Parameters<ChatCompletionStreamingAsyncIterator['executeAndAppendToolCalls']>): Promise<void> {
