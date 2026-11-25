@@ -26,7 +26,8 @@ export function describe(verdict: ThinkingLoopVerdict, contextFull = false): str
         return 'started going in circles';
     }
     const tokens = `about ${Math.round(verdict.chars / CHARS_PER_TOKEN / 1000)}k tokens`;
-    return contextFull ? `was about to fill the context window (${tokens} without acting)` : `ran for ${tokens} without acting`;
+    // A full window is about the chat's size, not the model's: it reasoned only as far as the room left allowed.
+    return contextFull ? `filled the room left in the context window (${tokens}; the chat takes the rest)` : `ran for ${tokens} without acting`;
 }
 
 /**

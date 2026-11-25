@@ -251,3 +251,14 @@ body .theia-thinking-preview {
     color: var(--theia-editorWarning-foreground);
     margin-top: 1px;
 }
+
+/* Images a tool returned (the agent's browser screenshots): Theia shows them at full size, so a 1280 px screenshot
+   overflowed the chat panel and showed as a cropped corner. Fit them to the panel. */
+.theia-toolCall-image-result img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin-top: calc(var(--theia-ui-padding) * 1.5);
+    border: 1px solid var(--theia-panel-border);
+    border-radius: 4px;
+}

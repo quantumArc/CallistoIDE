@@ -5,7 +5,7 @@
  ********************************************************************************/
 
 import { inject, injectable } from '@theia/core/shared/inversify';
-import { CancellationToken, CancellationTokenSource, Disposable, PreferenceService } from '@theia/core';
+import { CancellationToken, CancellationTokenSource, CommandService, Disposable, MessageService, PreferenceService } from '@theia/core';
 import {
     ChatModel, ChatMode, ChatRequestModel, ChatResponseContent, ChatResponseModel, CompactionChatResponseContent,
     CompactionChatResponseContentImpl, ErrorChatResponseContent, InformationalChatResponseContent, InformationalChatResponseContentImpl,
@@ -34,9 +34,12 @@ import { CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from
 import { carriedThinking } from '../common/carried-thinking.js';
 import { commandFailed, describe, keptReasoning, NudgeContext, nudgeFor } from '../common/callisto-nudges.js';
 import { SyntaxCheckResult, SyntaxCheckService } from '../common/syntax-check-protocol.js';
+import { BROWSER_FUNCTION_ID } from '../common/browser-protocol.js';
+import { messagesChars, splitToolImages, withoutToolImages } from '../common/tool-images.js';
 import { LOOP_BREAKER_PREF, MAX_THINKING_TOKENS_PREF, SUMMARIZE_AFTER_TOKENS_PREF } from './callisto-agent-preferences.js';
 import { contextOverflowMessage, parseContextOverflow } from '../common/context-overflow.js';
-import { LM_STUDIO_PREFIX, LocalModelsContribution } from './local-models-contribution.js';
+import { LM_STUDIO_PREFIX, LocalModelsContribution, SET_CONTEXT_LENGTH } from './local-models-contribution.js';
+import { suggestedContextLength } from '../common/context-status.js';
 import {
     CALLISTO_SUMMARY_PROVIDER, CallistoSummaryData, changedFiles, cleanSummary, isCallistoSummaryData, MAX_SUMMARY_CHARS, parseTodos,
     summarizeThreshold, summaryInstruction, summaryMessage, TodoItem
@@ -85,6 +88,20 @@ const FILE_CHANGE_TOOLS = new Set([WRITE_FILE_CONTENT_ID, WRITE_FILE_REPLACEMENT
 const SUMMARY_MAX_TOKENS = 8192;
 /** Reasoning past this while writing a summary means the model is working on the task again instead: give up. */
 const MAX_SUMMARY_THINKING_CHARS = 40000;
+/** Tokens a summary request needs beyond the chat itself: the instruction, and the summary with its reasoning. */
+const SUMMARY_ROOM_TOKENS = SUMMARY_MAX_TOKENS + 1000;
+/**
+ * Longest a message waits for a summary still being written. A summary that reuses LM Studio's cached prompt takes
+ * well under a minute; one that has to read the whole chat again can take many.
+ */
+const SUMMARY_WAIT_MS = 90_000;
+/** Share of the loaded context window from which Callisto suggests a larger one. */
+const OFFER_LARGER_CONTEXT_RATIO = 0.75;
+/**
+ * Below this much room for reasoning, interrupting the model and resuming it cannot help: the resumed call starts from
+ * the same nearly full window. Callisto hands the task back with a way out instead.
+ */
+const CRAMPED_ROOM_TOKENS = 8000;
 /** What a tool call gets while the model writes a summary. The tools stay declared so the prompt matches LM Studio's cache. */
 const TOOLS_OFF_WHILE_SUMMARIZING = 'Callisto: tools are switched off while you write the summary. Reply with the summary now.';
 
@@ -162,6 +179,12 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     @inject(LocalModelsContribution)
     protected readonly localModels: LocalModelsContribution;
 
+    @inject(MessageService)
+    protected readonly messageService: MessageService;
+
+    @inject(CommandService)
+    protected readonly commandService: CommandService;
+
     id = CALLISTO_AGENT_ID;
     name = CALLISTO_AGENT_ID;
     override description = 'Callisto\'s coding agent, tuned for local models such as Inkling. It plans with a todo list, edits files, runs '
@@ -198,8 +221,10 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     protected readonly requestNotes = new Map<string, LanguageModelMessage[]>();
     /** The nudge sent after each interruption notice, replayed at the notice's place in later requests. */
     protected readonly nudges = new WeakMap<object, string>();
-    /** Summaries being written, by chat session id. */
-    protected readonly summarizing = new Map<string, Promise<boolean>>();
+    /** Summaries being written, by chat session id, with what cancels them. */
+    protected readonly summarizing = new Map<string, { job: Promise<boolean>; cancel: CancellationTokenSource }>();
+    /** The loaded context size a larger window was last suggested for, per chat. */
+    protected readonly offeredContext = new WeakMap<ChatModel, number>();
     /** The request a chat's last failed summary was to cover up to: not tried again until the chat has moved on. */
     protected readonly failedSummaries = new WeakMap<ChatModel, string>();
 
@@ -247,6 +272,10 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         const previous = this.llmCalls.get(request);
         previous?.cancellationLink.dispose();
         const cancellation = new CancellationTokenSource();
+        // Taken before anything can cancel the source: one cancelled first hands out the frozen `CancellationToken.Cancelled`,
+        // which Theia's request logging wraps in a proxy that throws ("'get' on proxy: property 'onCancellationRequested' is a
+        // read-only and non-configurable data property"). That turned a request stopped during a summary into an error.
+        const cancellationToken = cancellation.token;
         const userToken = request.response.cancellationToken;
         const cancellationLink = userToken.onCancellationRequested(() => cancellation.cancel());
         if (userToken.isCancellationRequested) {
@@ -259,6 +288,12 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         if (!carriesReasoning(languageModel)) {
             // Reasoning marked for LM Studio must never reach a provider that would take the marker for a real signature.
             messages = messages.filter(message => !isCarriedThinking(message));
+        }
+        if (!this.seesImages(languageModel)) {
+            // Screenshots taken earlier in the chat, e.g. while a vision model was selected.
+            messages = messages.map(message => LanguageModelMessage.isToolResultMessage(message) && splitToolImages(message.content)
+                ? { ...message, content: withoutToolImages(message.content, imagesLeftOut(languageModel)) }
+                : message);
         }
         const tools = this.deduplicateTools(toolRequests.map(tool => this.withLoopGuard(request, tool)));
         const { commonSettings, providerSettings } = this.getSessionSettings(request);
@@ -283,7 +318,7 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
             agentId: this.id,
             sessionId: request.session.id,
             requestId: request.id,
-            cancellationToken: cancellation.token,
+            cancellationToken,
             promptVariantId,
             isPromptVariantCustomized
         });
@@ -324,6 +359,25 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                 reasoning: keptReasoning(outcome.reasoning, verdict),
                 contextFull: outcome.contextFull
             };
+            if (outcome.contextFull && verdict.kind === 'too-long' && verdict.chars / CEILING_CHARS_PER_TOKEN < CRAMPED_ROOM_TOKENS) {
+                // The window is nearly full. A resumed call starts from the same chat and hits the same wall: on 2026-11-25
+                // Inkling was interrupted four times in a row with 2k–7k tokens of room. Say so once, with the ways out.
+                const languageModel = this.llmCalls.get(request)?.languageModel;
+                const loaded = this.localModels.getLmStudioInfo(languageModel?.id)?.context?.loaded;
+                const used = this.contextUsedTokens(request);
+                const share = used !== undefined && loaded ? `This chat uses about ${formatTokens(used)} of the ${formatTokens(loaded)} tokens the model is `
+                    + `loaded with, which left about ${formatTokens(Math.round(verdict.chars / CEILING_CHARS_PER_TOKEN))} for its reasoning: ` : '';
+                const handBack = new InformationalChatResponseContentImpl(
+                    `Callisto paused the task: the context window is nearly full. ${share}too little to think the task through, and `
+                    + 'interrupting the model again would not free any. Choose a larger context length (click the context size in the status '
+                    + 'bar) and reply "continue", or start a new chat.');
+                request.response.response.addContent(handBack);
+                this.nudges.set(handBack, nudgeFor(verdict, { ...context, pausedForUser: true }));
+                if (languageModel) {
+                    this.offerLargerContext(request.session, languageModel, used, true);
+                }
+                return;
+            }
             if (attempts > MAX_LOOP_RESUMES) {
                 const handBack = new InformationalChatResponseContentImpl(
                     `Callisto paused the task: the model's reasoning ${describe(verdict, outcome.contextFull)} again, after ${MAX_LOOP_RESUMES} `
@@ -411,14 +465,23 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
     protected contextRoomTokens(request: MutableChatRequestModel): number | undefined {
         const call = this.llmCalls.get(request);
         const loaded = this.localModels.getLmStudioInfo(call?.languageModel.id)?.context?.loaded;
-        if (!loaded || !call) {
+        const used = this.contextUsedTokens(request);
+        if (!loaded || used === undefined) {
+            return undefined;
+        }
+        return Math.max(MIN_THINKING_ROOM_TOKENS, Math.floor(loaded * CONTEXT_CEILING_RATIO) - used);
+    }
+
+    /** Tokens of the context window the request's latest model call took, prompt and output; estimated before any call reports. */
+    protected contextUsedTokens(request: MutableChatRequestModel): number | undefined {
+        const call = this.llmCalls.get(request);
+        if (!call) {
             return undefined;
         }
         const usage = request.response.tokenUsage;
-        const used = usage && usage.inputTokens > 0
+        return usage && usage.inputTokens > 0
             ? usage.inputTokens + usage.outputTokens
-            : Math.round(JSON.stringify(call.messages).length / CEILING_CHARS_PER_TOKEN);
-        return Math.max(MIN_THINKING_ROOM_TOKENS, Math.floor(loaded * CONTEXT_CEILING_RATIO) - used);
+            : Math.round(messagesChars(call.messages) / CEILING_CHARS_PER_TOKEN);
     }
 
     /**
@@ -580,15 +643,24 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         const call = this.llmCalls.get(request);
         const requests = request.session.getRequests();
         if (!call || !isLocalModel(call.languageModel) || request.response.isError || requests[requests.length - 1] !== request
-            || this.summarizing.has(request.session.id) || !this.needsSummary(request.session, requests, call.languageModel)) {
+            || this.summarizing.has(request.session.id)) {
+            return;
+        }
+        if (!this.needsSummary(request.session, requests, call.languageModel)) {
+            // Too small to summarize, or too large for a summary to fit: a long chat may still be near the window's end.
+            this.offerLargerContext(request.session, call.languageModel, unsummarizedTokens(requests), false);
             return;
         }
         const session = request.session;
         const system = call.messages.filter(message => message.actor === 'system');
+        const cancel = new CancellationTokenSource();
         const job = this.summarize(session, requests, {
             system, tools: call.tools, deferredToolIds: call.deferredToolIds, languageModel: call.languageModel, settingsFrom: request
-        }, CancellationToken.None).finally(() => this.summarizing.delete(session.id));
-        this.summarizing.set(session.id, job);
+        }, cancel.token).finally(() => {
+            this.summarizing.delete(session.id);
+            cancel.dispose();
+        });
+        this.summarizing.set(session.id, { job, cancel });
     }
 
     /**
@@ -616,7 +688,18 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
             const pending = this.summarizing.get(session.id);
             if (pending) {
                 showProgress('Callisto is finishing its summary of the earlier conversation…');
-                await Promise.race([pending, whenCancelled(token)]);
+                const finished = await Promise.race([
+                    pending.job.then(() => true), whenCancelled(token).then(() => false), delay(SUMMARY_WAIT_MS).then(() => false)
+                ]);
+                if (!finished && !token.isCancellationRequested) {
+                    // A summary this slow is reading the whole chat again (its cached prompt was lost): on 2026-11-25 one
+                    // ran 13 minutes before it failed, with the user's message waiting behind it. Go on without it.
+                    pending.cancel.cancel();
+                    if (earlier.length > 0) {
+                        this.failedSummaries.set(session, earlier[earlier.length - 1].id);
+                    }
+                    this.logger.warn(`Callisto: the summary took over ${SUMMARY_WAIT_MS / 1000} s; cancelled it, and the request goes on unsummarized.`);
+                }
             }
             if (!token.isCancellationRequested && earlier.length > 0 && this.needsSummary(session, earlier, languageModel)) {
                 const tokens = unsummarizedTokens(earlier);
@@ -634,13 +717,56 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         return latestSummary(earlier)?.part !== before;
     }
 
-    /** Whether the part of the chat no summary covers yet is past the size from which Callisto summarizes. */
+    /**
+     * Whether the part of the chat no summary covers yet is past the size from which Callisto summarizes, and a summary
+     * request for it fits in the model's context window.
+     */
     protected needsSummary(session: ChatModel, requests: readonly ChatRequestModel[], languageModel: LanguageModel): boolean {
-        const threshold = summarizeThreshold(
-            this.preferences.get<number>(SUMMARIZE_AFTER_TOKENS_PREF), this.localModels.getLmStudioInfo(languageModel.id)?.context?.loaded);
+        const context = this.localModels.getLmStudioInfo(languageModel.id)?.context;
+        const threshold = summarizeThreshold(this.preferences.get<number>(SUMMARIZE_AFTER_TOKENS_PREF), context?.loaded);
         const tokens = unsummarizedTokens(requests);
         const last = requests[requests.length - 1];
-        return threshold !== undefined && tokens !== undefined && tokens >= threshold && !!last && this.failedSummaries.get(session) !== last.id;
+        if (threshold === undefined || tokens === undefined || tokens < threshold || !last || this.failedSummaries.get(session) === last.id) {
+            return false;
+        }
+        // The summary request is the chat plus the instruction and the summary. With several parallel slots LM Studio
+        // gives it a slot of its own while the chat's cached copy stays in the same window, so both have to fit: an
+        // 80k-token chat in a 99,584-token window with 4 slots failed with "Context size has been exceeded".
+        const copies = (context?.parallel ?? 1) > 1 ? 2 : 1;
+        if (context?.loaded && tokens * copies + SUMMARY_ROOM_TOKENS > context.loaded) {
+            this.logger.info(`Callisto: a ${tokens}-token chat cannot be summarized in a ${context.loaded}-token context `
+                + `with ${context.parallel ?? 1} parallel slot(s).`);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Suggests a larger context window when a chat with a local model is close to filling it, between messages: a
+     * bigger window means reloading the model, which stops whatever it is generating, so it is the user's call. At most
+     * once per chat and loaded size, except when the window is already full.
+     */
+    protected offerLargerContext(session: ChatModel, languageModel: LanguageModel, used: number | undefined, full: boolean): void {
+        const context = this.localModels.getLmStudioInfo(languageModel.id)?.context;
+        if (!context?.loaded || used === undefined || (!full && used < context.loaded * OFFER_LARGER_CONTEXT_RATIO)
+            || (!full && this.offeredContext.get(session) === context.loaded)) {
+            return;
+        }
+        const suggested = suggestedContextLength(context.loaded, context.max, used);
+        if (!suggested) {
+            return;
+        }
+        this.offeredContext.set(session, context.loaded);
+        const model = languageModel.id.replace(/^[^/]+\//, '');
+        const choose = 'Choose a context length…';
+        const message = `This chat uses ${formatTokens(used)} of the ${formatTokens(context.loaded)} tokens ${model} is loaded with`
+            + `${full ? ', which leaves it too little room to think' : ''}. A larger context window gives it more room `
+            + `(about ${formatTokens(suggested)} would hold this chat twice over), at the cost of memory and a reload.`;
+        this.messageService.warn(message, choose).then(answer => {
+            if (answer === choose) {
+                this.commandService.executeCommand(SET_CONTEXT_LENGTH.id, languageModel.id, suggested);
+            }
+        });
     }
 
     /**
@@ -659,6 +785,8 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         const tokensBefore = unsummarizedTokens(covered);
         const started = Date.now();
         const source = new CancellationTokenSource();
+        // Taken before the link can cancel the source (see sendLlmRequest).
+        const sourceToken = source.token;
         const link = token.onCancellationRequested(() => source.cancel());
         try {
             let messages: LanguageModelMessage[] = [
@@ -689,7 +817,7 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                 sessionId: session.id,
                 requestId: last.id,
                 subRequestId: `${last.id}.callisto-summary`,
-                cancellationToken: source.token
+                cancellationToken: sourceToken
             });
             const summary = cleanSummary(await readSummaryReply(response, source));
             if (!summary || token.isCancellationRequested) {
@@ -764,6 +892,12 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                     const notes = await this.notesAfterWrite(argString, state);
                     return notes ? `${result}\n\n${notes}` : result;
                 }
+                if (tool.id === BROWSER_FUNCTION_ID) {
+                    const languageModel = this.llmCalls.get(request)?.languageModel;
+                    if (languageModel && !this.seesImages(languageModel)) {
+                        return withoutToolImages(result, imagesLeftOut(languageModel));
+                    }
+                }
                 return result;
             }
         };
@@ -804,6 +938,18 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         }
     }
 
+    /**
+     * Whether images tool calls return (the browser's screenshots) can be shown to the model. Callisto's tool loop sends
+     * them for models on Theia's OpenAI-compatible provider; LM Studio refuses images for a model without a vision
+     * projector, so those must be known to have one. Other providers would turn the image into base64 text.
+     */
+    protected seesImages(languageModel: LanguageModel): boolean {
+        if (languageModel.id.startsWith(LM_STUDIO_PREFIX)) {
+            return this.localModels.getLmStudioInfo(languageModel.id)?.vision === true;
+        }
+        return languageModel.id.startsWith('openai/');
+    }
+
     protected guardStateFor(request: MutableChatRequestModel): LoopGuardState {
         let state = this.loopGuards.get(request);
         if (!state) {
@@ -812,6 +958,10 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         }
         return state;
     }
+}
+
+function imagesLeftOut(languageModel: LanguageModel): string {
+    return `Screenshot left out: ${languageModel.id.replace(/^[^/]+\//, '')} cannot see images. Judge the page by the log, controls and text above.`;
 }
 
 function isCarriedThinking(message: LanguageModelMessage): boolean {
@@ -928,6 +1078,14 @@ async function readSummaryReply(response: LanguageModelResponse, source: Cancell
         }
     }
     return text;
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatTokens(tokens: number): string {
+    return tokens.toLocaleString('en-US');
 }
 
 function whenCancelled(token: CancellationToken): Promise<void> {

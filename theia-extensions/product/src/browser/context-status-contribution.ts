@@ -13,7 +13,7 @@ import { ChatResponseModel, CompactionChatResponseContent, ResponseTokenUsage } 
 import { CALLISTO_SUMMARY_PROVIDER, isCallistoSummaryData } from '../common/conversation-summary.js';
 import { contextStatus } from '../common/context-status.js';
 import { AiRunStatsService } from './ai-run-stats.js';
-import { LocalModelsContribution, REFRESH_LOCAL_MODELS } from './local-models-contribution.js';
+import { LocalModelsContribution, SET_CONTEXT_LENGTH } from './local-models-contribution.js';
 
 const STATUS_BAR_ID = 'callisto-context-window';
 
@@ -80,16 +80,19 @@ export class ContextStatusContribution implements FrontendApplicationContributio
                     + 'and this shows its exact size once it has run.',
                 alignment: StatusBarAlignment.LEFT,
                 priority: 99,
-                command: REFRESH_LOCAL_MODELS.id
+                command: SET_CONTEXT_LENGTH.id,
+                arguments: [latest.model]
             });
             return;
         }
         const info = this.localModels.getLmStudioInfo(latest.model);
+        const preferred = this.localModels.preferredContextLength;
         const status = contextStatus({
             usedTokens: latest.usage.inputTokens + latest.usage.outputTokens,
             loadedContext: info?.context?.loaded,
             maxContext: info?.context?.max,
-            model: latest.model?.replace(/^lmstudio\//, '')
+            model: latest.model?.replace(/^lmstudio\//, ''),
+            preferredContext: info?.context?.loaded ? preferred : undefined
         });
         this.statusBar.setElement(STATUS_BAR_ID, {
             text: status.text,
@@ -100,7 +103,10 @@ export class ContextStatusContribution implements FrontendApplicationContributio
                 : status.level === 'warn' ? 'var(--theia-statusBarItem-warningBackground)' : undefined,
             color: status.level === 'full' ? 'var(--theia-statusBarItem-errorForeground)'
                 : status.level === 'warn' ? 'var(--theia-statusBarItem-warningForeground)' : undefined,
-            command: REFRESH_LOCAL_MODELS.id
+            // A click opens the context-length picker for this model, with the user's own setting preselected
+            // when LM Studio has the model loaded with another length.
+            command: SET_CONTEXT_LENGTH.id,
+            arguments: [latest.model, preferred !== info?.context?.loaded ? preferred : undefined]
         });
     }
 

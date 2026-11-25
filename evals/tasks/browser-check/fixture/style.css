@@ -1,0 +1,10 @@
+body { font-family: system-ui, sans-serif; background: #f4f4f6; margin: 0; }
+main { max-width: 420px; margin: 48px auto; background: #fff; padding: 24px 28px; border-radius: 12px; box-shadow: 0 2px 12px #0002; }
+h1 { margin-top: 0; }
+form { display: flex; gap: 8px; }
+#new-todo { flex: 1; padding: 8px; font-size: 16px; }
+button { padding: 8px 16px; font-size: 16px; }
+#todo-list { list-style: none; padding: 0; }
+#todo-list li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid #eee; }
+#todo-list li.done span { text-decoration: line-through; color: #999; }
+#count { color: #666; }

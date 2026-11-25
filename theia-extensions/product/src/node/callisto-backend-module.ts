@@ -17,6 +17,8 @@ import { installLocalModelTimeouts } from './local-model-timeouts.js';
 import { BackendApplicationContribution } from '@theia/core/lib/node';
 import { WEB_SEARCH_PATH, WebSearchService } from '../common/web-search-protocol.js';
 import { WebSearchServiceImpl } from './web-search-service.js';
+import { BROWSER_SERVICE_PATH, BrowserService } from '../common/browser-protocol.js';
+import { BrowserServiceImpl } from './browser-service.js';
 
 // Long prompts on a local model take minutes before the first byte; do not let fetch give up after 5 (see the function).
 installLocalModelTimeouts();
@@ -34,6 +36,14 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
     bind(BackendApplicationContribution).toService(WebSearchServiceImpl);
     bind(ConnectionHandler).toDynamicValue(ctx =>
         new RpcConnectionHandler(WEB_SEARCH_PATH, () => ctx.container.get(WebSearchService))
+    ).inSingletonScope();
+
+    bind(BrowserServiceImpl).toSelf().inSingletonScope();
+    bind(BrowserService).toService(BrowserServiceImpl);
+    // Closes the agent's headless browser when Callisto exits.
+    bind(BackendApplicationContribution).toService(BrowserServiceImpl);
+    bind(ConnectionHandler).toDynamicValue(ctx =>
+        new RpcConnectionHandler(BROWSER_SERVICE_PATH, () => ctx.container.get(BrowserService))
     ).inSingletonScope();
 
     bind(SyntaxCheckServiceImpl).toSelf().inSingletonScope();

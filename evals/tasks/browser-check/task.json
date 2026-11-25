@@ -1,0 +1,9 @@
+{
+    "title": "Fix a web page whose bugs only show in a browser, and check it there",
+    "turns": [
+        {
+            "message": "@Callisto The to-do page in this project (index.html) is broken: typing a to-do and pressing Add or Enter never shows it in the list. Find out why and fix it, and make sure adding to-dos, ticking them off and the \"items left\" counter all work.",
+            "timeoutMinutes": 15
+        }
+    ]
+}

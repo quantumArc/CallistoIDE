@@ -6,14 +6,18 @@
 
 import { inject, injectable } from '@theia/core/shared/inversify';
 import { FrontendApplicationContribution } from '@theia/core/lib/browser';
-import { Command, CommandContribution, CommandRegistry, Emitter, Event, MessageService, PreferenceService } from '@theia/core';
+import { Command, CommandContribution, CommandRegistry, Emitter, Event, MessageService, PreferenceScope, PreferenceService } from '@theia/core';
+import { ConfirmDialog } from '@theia/core/lib/browser/dialogs';
+import { QuickInputService, QuickPickItem } from '@theia/core/lib/common/quick-pick-service';
 import { ReasoningLevel, ReasoningSupport } from '@theia/ai-core';
 import { OpenAiLanguageModelsManager, OpenAiModelDescription } from '@theia/ai-openai/lib/common';
 import { OLLAMA_REASONING_SUPPORT, OllamaLanguageModelsManager } from '@theia/ai-ollama/lib/common';
 import { HOST_PREF as OLLAMA_HOST_PREF } from '@theia/ai-ollama/lib/common/ollama-preferences';
-import { LocalModelDiscoveryService, LocalModelInfo } from '../common/local-models-protocol.js';
+import { LmStudioLoadEstimate, LocalModelDiscoveryService, LocalModelInfo } from '../common/local-models-protocol.js';
+import { CONTEXT_LENGTHS } from '../common/context-status.js';
 import {
-    LOCAL_MODELS_AUTO_DISCOVER_PREF, LOCAL_MODELS_LM_STUDIO_URL_PREF, LOCAL_MODELS_REFRESH_INTERVAL_PREF
+    LOCAL_MODELS_AUTO_DISCOVER_PREF, LOCAL_MODELS_CONTEXT_LENGTH_PREF, LOCAL_MODELS_LM_STUDIO_URL_PREF, LOCAL_MODELS_PARALLEL_PREF,
+    LOCAL_MODELS_REFRESH_INTERVAL_PREF
 } from './local-models-preferences.js';
 
 export const REFRESH_LOCAL_MODELS: Command = {
@@ -21,6 +25,17 @@ export const REFRESH_LOCAL_MODELS: Command = {
     category: 'Callisto',
     label: 'Refresh Local Models'
 };
+
+/** Arguments: optionally the Callisto model id (`lmstudio/<key>`) and a size to preselect. */
+export const SET_CONTEXT_LENGTH: Command = {
+    id: 'callisto.setModelContextLength',
+    category: 'Callisto',
+    label: 'Set Model Context Length…'
+};
+
+interface ContextSizeItem extends QuickPickItem {
+    size: number;
+}
 
 export const LM_STUDIO_PREFIX = 'lmstudio/';
 const OLLAMA_PREFIX = 'ollama/';
@@ -54,6 +69,9 @@ export class LocalModelsContribution implements FrontendApplicationContribution,
 
     @inject(MessageService)
     protected readonly messages: MessageService;
+
+    @inject(QuickInputService)
+    protected readonly quickInput: QuickInputService;
 
     /** Registered LM Studio models, by id, with a fingerprint of their settings to notice changes. */
     protected lmStudioModels = new Map<string, string>();
@@ -101,6 +119,129 @@ export class LocalModelsContribution implements FrontendApplicationContribution,
                 }
             }
         });
+        commands.registerCommand(SET_CONTEXT_LENGTH, {
+            execute: (languageModelId?: string, suggested?: number) => this.chooseContextLength(languageModelId, suggested)
+        });
+    }
+
+    /** The context length the user chose for LM Studio models; undefined when they left it to LM Studio. */
+    get preferredContextLength(): number | undefined {
+        return this.preferences.get<number>(LOCAL_MODELS_CONTEXT_LENGTH_PREF, 0) || undefined;
+    }
+
+    protected get parallel(): number {
+        return Math.max(1, Math.round(this.preferences.get<number>(LOCAL_MODELS_PARALLEL_PREF, 1) ?? 1));
+    }
+
+    /**
+     * Lets the user pick a context length for an LM Studio model, with LM Studio's memory estimate for each, then saves it
+     * as their setting and reloads the model with it, after a confirmation (whatever the model is generating stops).
+     */
+    async chooseContextLength(languageModelId?: string, suggested?: number): Promise<void> {
+        await this.refresh();
+        const key = languageModelId?.startsWith(LM_STUDIO_PREFIX) ? languageModelId.slice(LM_STUDIO_PREFIX.length) : await this.pickLmStudioModel();
+        if (!key) {
+            return;
+        }
+        const context = this.lmStudioInfo.get(key)?.context;
+        const loaded = context?.loaded;
+        const max = context?.max;
+        const chosen = this.preferredContextLength;
+        const parallel = this.parallel;
+        const sizes = [...new Set([...CONTEXT_LENGTHS.filter(size => !max || size <= max), ...[loaded, chosen, suggested, max].filter(
+            (size): size is number => !!size && size <= 1_048_576)])].sort((a, b) => a - b);
+        const estimates = new Map<number, LmStudioLoadEstimate>();
+        const toItem = (size: number): ContextSizeItem => {
+            const estimate = estimates.get(size);
+            const notes = [
+                size === loaded ? 'loaded now' : undefined,
+                size === chosen && size !== loaded ? 'your setting' : undefined,
+                size === suggested && size !== loaded ? 'suggested' : undefined,
+                size === max ? 'the most this model supports' : undefined
+            ].filter(Boolean).join(' · ');
+            const memory = !estimate ? 'Estimating memory…'
+                : estimate.gib !== undefined ? `About ${estimate.gib.toFixed(1)} GB of memory${estimate.fits === false ? ', more than LM Studio allows on this machine' : ''}`
+                    : `No estimate: ${estimate.error ?? 'LM Studio did not say'}`;
+            return { size, label: `${size.toLocaleString('en-US')} tokens`, description: notes, detail: memory };
+        };
+        const pick = this.quickInput.createQuickPick<ContextSizeItem>();
+        pick.title = `Context length for ${key}`;
+        pick.placeholder = 'The context window holds Callisto\'s instructions, the chat and the model\'s reasoning. Larger needs more memory.';
+        const show = () => {
+            const active = pick.activeItems[0]?.size ?? suggested ?? loaded ?? chosen;
+            const items = sizes.map(toItem);
+            pick.items = items;
+            pick.activeItems = items.filter(item => item.size === active);
+        };
+        show();
+        pick.busy = true;
+        const picked = new Promise<number | undefined>(resolve => {
+            pick.onDidAccept(() => {
+                resolve((pick.selectedItems[0] ?? pick.activeItems[0])?.size);
+                pick.hide();
+            });
+            pick.onDidHide(() => resolve(undefined));
+        });
+        pick.show();
+        Promise.all(sizes.map(async size => {
+            estimates.set(size, await this.discovery.estimateLmStudioLoad(key, size, parallel));
+            show();
+        })).finally(() => { pick.busy = false; });
+        const length = await picked;
+        pick.dispose();
+        if (!length) {
+            return;
+        }
+        if (length === loaded && parallel === (context?.parallel ?? parallel)) {
+            await this.preferences.set(LOCAL_MODELS_CONTEXT_LENGTH_PREF, length, PreferenceScope.User);
+            this.messages.info(`${key} is already loaded with a ${length.toLocaleString('en-US')}-token context. Saved it as your setting.`);
+            return;
+        }
+        const lengthEstimate = estimates.get(length) ?? await this.discovery.estimateLmStudioLoad(key, length, parallel);
+        const memoryNote = lengthEstimate.gib !== undefined ? ` It needs about ${lengthEstimate.gib.toFixed(1)} GB of memory.` : '';
+        const tooBig = lengthEstimate.fits === false ? ' LM Studio estimates that this is more than it allows on this machine, so loading may fail.' : '';
+        const confirmed = await new ConfirmDialog({
+            title: 'Reload the model?',
+            msg: `Reload ${key} with a ${length.toLocaleString('en-US')}-token context window${parallel === 1 ? '' : ` and ${parallel} parallel slots`}?${memoryNote}${tooBig} `
+                + 'Whatever it is generating now stops, and the next message in each chat reads that chat again once.',
+            ok: 'Reload',
+            cancel: 'Cancel'
+        }).open();
+        if (!confirmed) {
+            return;
+        }
+        await this.preferences.set(LOCAL_MODELS_CONTEXT_LENGTH_PREF, length, PreferenceScope.User);
+        const progress = await this.messages.showProgress({ text: `Reloading ${key} with a ${length.toLocaleString('en-US')}-token context…` });
+        try {
+            const result = await this.discovery.reloadLmStudioModel(key, length, parallel);
+            await this.refresh();
+            if (result.ok) {
+                this.messages.info(`${key} is loaded with a ${length.toLocaleString('en-US')}-token context.`);
+            } else {
+                this.messages.error(`Could not reload ${key}: ${result.error}`);
+            }
+        } finally {
+            progress.cancel();
+        }
+    }
+
+    /** The LM Studio model to change: the only loaded one, or the user's pick (loaded models first). */
+    protected async pickLmStudioModel(): Promise<string | undefined> {
+        const models = [...this.lmStudioInfo.values()];
+        const loaded = models.filter(model => model.context?.loaded);
+        if (loaded.length === 1) {
+            return loaded[0].id;
+        }
+        const items = [...loaded, ...models.filter(model => !model.context?.loaded)].map(model => ({
+            id: model.id,
+            label: model.id,
+            description: model.context?.loaded ? `loaded with ${model.context.loaded.toLocaleString('en-US')} tokens` : 'not loaded'
+        }));
+        if (items.length === 0) {
+            this.messages.warn('LM Studio lists no chat models. Is it running?');
+            return undefined;
+        }
+        return (await this.quickInput.showQuickPick(items, { placeholder: 'Which LM Studio model?' }))?.id;
     }
 
     refresh(): Promise<RefreshSummary> {

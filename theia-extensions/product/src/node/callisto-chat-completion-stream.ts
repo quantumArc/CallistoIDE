@@ -5,11 +5,14 @@
  ********************************************************************************/
 
 import { injectable } from '@theia/core/shared/inversify';
-import { isTextResponsePart, isThinkingResponsePart, LanguageModelMessage, LanguageModelStreamResponsePart } from '@theia/ai-core';
+import {
+    isTextResponsePart, isThinkingResponsePart, LanguageModelMessage, LanguageModelStreamResponsePart, ToolCallImageResult, ToolCallResult
+} from '@theia/ai-core';
 import { ChatCompletionStreamingAsyncIterator } from '@theia/ai-openai/lib/node/openai-chat-completion-stream';
 import { OpenAiModelUtils } from '@theia/ai-openai/lib/node/openai-model-utils';
 import { budgetReasoning, CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from '../common/reasoning-text.js';
 import { ThinkTagPart, ThinkTagSplitter, withoutThinkBlocks } from '../common/think-tags.js';
+import { insertToolImages, splitToolImages, toolImagesMessage } from '../common/tool-images.js';
 
 /** The field LM Studio, llama.cpp, vLLM and DeepSeek use for reasoning, in streamed deltas and in input messages alike. */
 const REASONING_FIELD = 'reasoning_content';
@@ -115,10 +118,27 @@ export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIt
         return { ...result, assistantText: withoutThinkBlocks(result.assistantText) };
     }
 
+    /** Images the turn's tool calls returned, sent to the model after the tool messages (see tool-images.ts). */
+    protected turnImages: ToolCallImageResult[] = [];
+
+    protected override formatToolResult(result: ToolCallResult): string {
+        const split = splitToolImages(result);
+        if (!split) {
+            return super.formatToolResult(result);
+        }
+        this.turnImages.push(...split.images);
+        return split.text;
+    }
+
     protected override async executeAndAppendToolCalls(...args: Parameters<ChatCompletionStreamingAsyncIterator['executeAndAppendToolCalls']>): Promise<void> {
         const reasoning = this.turnReasoning;
         const assistantIndex = this.messages.length;
+        this.turnImages = [];
         await super.executeAndAppendToolCalls(...args);
+        if (this.turnImages.length > 0) {
+            this.messages.push(toolImagesMessage(this.turnImages));
+            this.turnImages = [];
+        }
         const assistant = this.messages[assistantIndex] as MessageWithReasoning | undefined;
         if (assistant?.role === 'assistant') {
             rememberToolCallTurn((assistant.tool_calls ?? []).map(call => call.id));
@@ -153,7 +173,31 @@ export class CallistoChatCompletionStream extends ChatCompletionStreamingAsyncIt
 @injectable()
 export class CallistoOpenAiModelUtils extends OpenAiModelUtils {
 
+    /** Images taken out of tool results by {@link toOpenAIMessage} during one `processMessages`, by tool call id. */
+    protected toolImages = new Map<string, ToolCallImageResult[]>();
+
+    protected override toOpenAIMessage(...args: Parameters<OpenAiModelUtils['toOpenAIMessage']>): ReturnType<OpenAiModelUtils['toOpenAIMessage']> {
+        const [message] = args;
+        if (LanguageModelMessage.isToolResultMessage(message) && typeof message.content !== 'string') {
+            const split = splitToolImages(message.content);
+            if (split) {
+                this.toolImages.set(message.tool_use_id, split.images);
+                return { role: 'tool', tool_call_id: message.tool_use_id, content: split.text };
+            }
+        }
+        return super.toOpenAIMessage(...args);
+    }
+
     override processMessages(...args: Parameters<OpenAiModelUtils['processMessages']>): ReturnType<OpenAiModelUtils['processMessages']> {
+        try {
+            this.toolImages = new Map();
+            return this.processMessagesWithImages(...args);
+        } finally {
+            this.toolImages = new Map();
+        }
+    }
+
+    protected processMessagesWithImages(...args: Parameters<OpenAiModelUtils['processMessages']>): ReturnType<OpenAiModelUtils['processMessages']> {
         const [messages] = args;
         // Reasoning of each turn, keyed by the id of the turn's first tool call.
         const reasoningByToolCall = new Map<string, string>();
@@ -171,7 +215,8 @@ export class CallistoOpenAiModelUtils extends OpenAiModelUtils {
                 pending = '';
             }
         }
-        const result = regroupParallelToolCalls(super.processMessages(...args) as MessageWithReasoning[]) as ReturnType<OpenAiModelUtils['processMessages']>;
+        const regrouped = regroupParallelToolCalls(super.processMessages(...args) as MessageWithReasoning[]);
+        const result = insertToolImages(regrouped, this.toolImages) as ReturnType<OpenAiModelUtils['processMessages']>;
         if (reasoningByToolCall.size === 0) {
             return result;
         }

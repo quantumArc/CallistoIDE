@@ -14,6 +14,8 @@ export const SUMMARIZE_AFTER_TOKENS_PREF = 'callisto.agent.summarizeAfterTokens'
 export const WEB_SEARCH_ENABLED_PREF = 'callisto.webSearch.enabled';
 export const WEB_SEARCH_URL_PREF = 'callisto.webSearch.searxngUrl';
 export const WEB_SEARCH_CONTROL_SCRIPT_PREF = 'callisto.webSearch.controlScript';
+export const BROWSER_ENABLED_PREF = 'callisto.browser.enabled';
+export const BROWSER_EXECUTABLE_PREF = 'callisto.browser.executablePath';
 
 export const CallistoAgentPreferencesSchema: PreferenceSchema = {
     properties: {
@@ -71,6 +73,23 @@ export const CallistoAgentPreferencesSchema: PreferenceSchema = {
                 + '`~/Documents/searxng/local/searxng.sh`. When the agent searches and nothing answers at `#callisto.webSearch.searxngUrl#`, '
                 + 'Callisto runs `<script> start`, and `<script> stop` when Callisto exits; a SearXNG you started yourself is left running. '
                 + 'Empty: Callisto never starts SearXNG, and the agent tells you when it is not running.'
+        },
+        [BROWSER_ENABLED_PREF]: {
+            type: 'boolean',
+            title: AI_CORE_PREFERENCES_TITLE,
+            default: true,
+            markdownDescription: 'Let the Callisto agent check web pages it builds in a headless browser (`browser` tool): open an HTML file '
+                + 'of the workspace or a dev server on this machine, click and type as a user would, and get back the console errors, '
+                + 'the visible text and a screenshot. A model that can see images (Inkling 2 Mini can) looks at the screenshot itself; '
+                + 'others get the text only. It opens only pages on this machine, never the internet. Details: `docs/browser.md`.'
+        },
+        [BROWSER_EXECUTABLE_PREF]: {
+            type: 'string',
+            title: AI_CORE_PREFERENCES_TITLE,
+            default: '',
+            markdownDescription: 'Chrome, Chromium, Edge or Brave executable for the agent\'s browser. Empty (the default): the newest '
+                + 'Chrome Puppeteer downloaded to `~/.cache/puppeteer` (the headless shell first), else an installed Chrome, Edge, '
+                + 'Brave or Chromium.'
         }
     }
 };

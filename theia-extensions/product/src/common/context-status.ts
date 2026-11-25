@@ -18,6 +18,8 @@ export interface ContextStatusInput {
     maxContext?: number;
     /** Display name of the model. */
     model?: string;
+    /** The context length the user chose (`callisto.localModels.contextLength`), when they chose one. */
+    preferredContext?: number;
 }
 
 export interface ContextStatus {
@@ -33,7 +35,7 @@ export interface ContextStatus {
  * when the model supports more than it is loaded with.
  */
 export function contextStatus(input: ContextStatusInput): ContextStatus {
-    const { usedTokens, loadedContext, maxContext, model } = input;
+    const { usedTokens, loadedContext, maxContext, model, preferredContext } = input;
     const lines: string[] = [];
     if (!loadedContext) {
         lines.push(`This chat's last model call used ${count(usedTokens)} tokens${model ? ` on ${model}` : ''}.`,
@@ -42,21 +44,45 @@ export function contextStatus(input: ContextStatusInput): ContextStatus {
     }
     const ratio = usedTokens / loadedContext;
     const percent = Math.min(999, Math.round(ratio * 100));
-    const level: ContextStatus['level'] = ratio >= CONTEXT_FULL_RATIO ? 'full' : ratio >= CONTEXT_WARN_RATIO ? 'warn' : 'ok';
+    let level: ContextStatus['level'] = ratio >= CONTEXT_FULL_RATIO ? 'full' : ratio >= CONTEXT_WARN_RATIO ? 'warn' : 'ok';
     lines.push(`Context window: ${count(usedTokens)} of ${count(loadedContext)} tokens (${percent}%) used by this chat${model ? ` on ${model}` : ''}.`,
-        'Every message re-sends the whole chat, so a fuller context also means slower replies.');
-    if (level === 'full') {
-        lines.push('', 'Nearly full: start a new chat now. Once the chat no longer fits, the model cannot see all of it.');
+        'It holds Callisto\'s instructions, the whole chat and the model\'s reasoning, so a full one leaves the model little room to think. '
+        + 'Every message re-sends the whole chat, so a fuller context also means slower replies.');
+    const mismatch = !!preferredContext && preferredContext !== loadedContext;
+    if (mismatch) {
+        level = level === 'full' ? 'full' : 'warn';
+        lines.push('', `LM Studio has the model loaded with ${count(loadedContext)} tokens, but your setting is ${count(preferredContext!)}. `
+            + `Click to reload it with ${count(preferredContext!)}.`);
+    } else if (level === 'full') {
+        lines.push('', 'Nearly full: start a new chat, or click to choose a longer context length.');
     } else if (level === 'warn') {
-        lines.push('', 'Getting full: start a new chat for the next task.');
+        lines.push('', 'Getting full: start a new chat for the next task, or click to choose a longer context length.');
+    } else {
+        lines.push('', 'Click to change the context length.');
     }
-    if (level !== 'ok' && maxContext && maxContext > loadedContext) {
-        lines.push(`Or reload the model in LM Studio with a longer context length (it supports up to ${count(maxContext)}); `
-            + 'that uses more memory.');
+    if (level !== 'ok' && maxContext && maxContext > loadedContext && !mismatch) {
+        lines.push(`The model supports up to ${count(maxContext)}; a longer context uses more memory.`);
     }
-    lines.push('', 'No reload is needed to free memory: LM Studio reuses and evicts its prompt cache on its own.');
     const icon = level === 'ok' ? '$(layers)' : '$(warning)';
-    return { text: `${icon} ${short(usedTokens)} / ${short(loadedContext)} ctx (${percent}%)`, tooltip: lines.join('\n'), level };
+    const setting = mismatch ? ` · set ${short(preferredContext!)}` : '';
+    return { text: `${icon} ${short(usedTokens)} / ${short(loadedContext)} ctx (${percent}%)${setting}`, tooltip: lines.join('\n'), level };
+}
+
+/** Context lengths Callisto offers, up to what a model supports. */
+export const CONTEXT_LENGTHS = [32_768, 65_536, 131_072, 196_608, 262_144, 393_216, 524_288, 1_048_576];
+
+/**
+ * The context length to suggest when a chat of `used` tokens has filled a window of `loaded`: the smallest offered
+ * length with room for the chat twice over (so the model has as much room to think as the chat takes), and at least
+ * the next step up. Undefined when the model supports nothing larger.
+ */
+export function suggestedContextLength(loaded: number, max: number | undefined, used: number): number | undefined {
+    const ceiling = max ?? CONTEXT_LENGTHS[CONTEXT_LENGTHS.length - 1];
+    const larger = CONTEXT_LENGTHS.filter(length => length > loaded && length <= ceiling);
+    if (larger.length === 0) {
+        return ceiling > loaded ? ceiling : undefined;
+    }
+    return larger.find(length => length >= used * 2) ?? larger[larger.length - 1];
 }
 
 function count(tokens: number): string {
