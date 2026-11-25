@@ -52,9 +52,12 @@ A full run takes about 8 minutes at the `low` thinking level, mostly model time;
 | `build-wordfreq` | Writing a module plus command-line tool from a spec. | Hidden tests of `topWords` and the CLI pass. |
 | `long-chat-summary` | Chat summaries: a ~25k-token first turn, then a follow-up that needs its answer. Runs with `callisto.agent.summarizeAfterTokens` at 16,000. | A summary was written, and the follow-up names `js/ai.js` and 900; no file changed. |
 | `browser-check` | Checking a web page in the browser (see `docs/browser.md`): a to-do page whose two bugs only show when it runs (an import of a name the module does not export, and a form that reloads the page on submit). The task does not mention the browser. | The agent called `browser`, and adding to-dos, ticking one off and the "items left" counter work in a fresh browser with no page errors. |
+| `model-3d` | Modelling in 3D (see `docs/3d-models.md`): rework the crude rook and knight of a three.js chess set (open-topped rook with floating battlements, a 6-point profile, a flat cut-out knight) into Staunton pieces. The task does not mention `view3d`. Its `setup` installs three.js with npm (from npm's cache when it can); skipped if that fails. | The agent called `view3d`, and both pieces pass its checks: no loose parts, holes, coarse profiles or flat slabs. The picture of both is saved next to the scratch workspace (`rook-and-knight.jpg`) for judging the looks by eye. |
 | `web-lookup` | Web search: find SearXNG's API documentation and read it (see `docs/web-search.md`). Needs SearXNG running at `http://127.0.0.1:8888` (or `CALLISTO_EVAL_SEARXNG_URL`); skipped otherwise. | The agent called `webSearch` and `fetchWebPage`, and named the `format` parameter with json, csv and rss. |
 
-The hidden tests live in each task's `hidden/` folder, outside the scratch project, so the model never sees them.
+The hidden tests live in each task's `hidden/` folder, outside the scratch project, so the model never sees them. A task's
+`setup` (in `task.json`, a command as an argument list) runs in the scratch project after the fixture is copied, for
+dependencies that are not committed with it.
 
 ## What the numbers mean
 

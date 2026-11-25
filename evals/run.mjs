@@ -98,6 +98,14 @@ async function runTask(id, browser, { workRoot, resultsDir }) {
     if (missing.length > 0) {
         return { ...result, skipped: true, seconds: 0, notes: [`skipped: ${missing.join('; ')}`] };
     }
+    if (Array.isArray(task.setup) && task.setup.length > 0) {
+        // e.g. installing the fixture's dependencies, which are not committed with it.
+        try {
+            execFileSync(task.setup[0], task.setup.slice(1), { cwd: workspace, stdio: 'pipe', timeout: 5 * 60_000 });
+        } catch (error) {
+            return { ...result, skipped: true, seconds: 0, notes: [`skipped: setup \`${task.setup.join(' ')}\` failed: ${String(error.message).split('\n')[0]}`] };
+        }
+    }
     const started = Date.now();
     let server;
     let page;

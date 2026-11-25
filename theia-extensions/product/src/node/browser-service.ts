@@ -10,12 +10,15 @@ import { createReadStream, existsSync, promises as fs, readdirSync } from 'fs';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { AddressInfo } from 'net';
 import { homedir } from 'os';
-import { extname, join, relative, resolve, sep } from 'path';
+import { basename, dirname, extname, join, relative, resolve, sep } from 'path';
 import { launch } from 'puppeteer-core';
 import type { Browser, ConsoleMessage, Dialog, HTTPRequest, HTTPResponse, Page } from 'puppeteer-core';
 import {
-    BrowserAction, BrowserElementSummary, BrowserLogEntry, BrowserRequest, BrowserResult, BrowserService
+    BrowserAction, BrowserElementSummary, BrowserLogEntry, BrowserRequest, BrowserResult, BrowserService, VIEW3D_MODEL_EXTENSIONS,
+    View3dObject, View3dRequest, View3dResult
 } from '../common/browser-protocol.js';
+import { importMapFor } from './view3d-import-map.js';
+import { VIEW3D_CSS, VIEW3D_SCRIPT } from './view3d-viewer.js';
 
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 800;
@@ -37,6 +40,13 @@ const MAX_EVALUATE_CHARS = 4_000;
 const MAX_TEXT_CHARS = 1_500;
 const MAX_ELEMENTS = 40;
 const SCREENSHOT_QUALITY = 70;
+const VIEW3D_PAGE = '/__callisto/view3d.html';
+const VIEW3D_MODULE = '/__callisto/view3d.js';
+const VIEW3D_SCRIPT_EXTENSIONS = ['.js', '.mjs'];
+/** Objects side by side in one picture: more would be too small to judge. */
+const VIEW3D_MAX_OBJECTS = 8;
+/** Loading the module, building the objects, checking and drawing them. */
+const VIEW3D_TIMEOUT_MS = 30_000;
 
 /**
  * Chrome's own diagnostics, which say nothing about the page: SwiftShader's warning every time a screenshot reads the
@@ -69,8 +79,24 @@ class FolderServer {
      * `dist/index.html` asks for `/assets/…` from the site root; when that is not in the root, it is looked up here.
      */
     protected readonly pageDirs: string[] = [];
+    /** Pages Callisto itself serves under `/__callisto/` (the 3D viewer), by path. */
+    protected readonly virtual = new Map<string, { type: string; body: string }>();
 
     constructor(readonly root: string) { }
+
+    get origin(): string {
+        return `http://127.0.0.1:${this.port}`;
+    }
+
+    /** Serves `body` at `path` (e.g. `/__callisto/view3d.html`) instead of a workspace file. */
+    setVirtual(path: string, type: string, body: string): void {
+        this.virtual.set(path, { type, body });
+    }
+
+    /** The root-relative URL path of a file inside the root, e.g. `/src/pieces.js`. */
+    pathFor(file: string): string {
+        return '/' + relative(this.root, file).split(sep).map(encodeURIComponent).join('/');
+    }
 
     async start(): Promise<void> {
         if (this.server) {
@@ -124,6 +150,12 @@ class FolderServer {
             return;
         }
         const pathname = decodeURIComponentSafe(new URL(request.url ?? '/', 'http://127.0.0.1').pathname);
+        const own = this.virtual.get(pathname);
+        if (own) {
+            response.writeHead(200, { 'Content-Type': own.type, 'Cache-Control': 'no-store' });
+            response.end(request.method === 'HEAD' ? undefined : own.body);
+            return;
+        }
         for (const base of ['', ...this.pageDirs]) {
             const file = await this.find(join(this.root, base, pathname));
             if (file) {
@@ -202,6 +234,9 @@ interface PageState {
     label: string;
     log: LogCollector;
     viewport: { width: number; height: number };
+    /** The page view3d draws on, apart from `page` so that the agent's open app stays as it was. */
+    viewPage?: Page;
+    viewLog: LogCollector;
 }
 
 /**
@@ -260,6 +295,9 @@ export class BrowserServiceImpl implements BrowserService, BackendApplicationCon
             return { ...result, error: errorMessage(error) };
         }
         result.browser = state.label;
+        if (state.viewPage) {
+            await state.page.bringToFront().catch(() => undefined);
+        }
         if (state.viewport.width !== viewport.width || state.viewport.height !== viewport.height) {
             await state.page.setViewport({ ...viewport, deviceScaleFactor: 1 });
             state.viewport = viewport;
@@ -377,13 +415,7 @@ export class BrowserServiceImpl implements BrowserService, BackendApplicationCon
                     throw new Error(`${open.file} is a folder without an index.html: pass the HTML file to open.`);
                 }
             }
-            let server = this.servers.get(root);
-            if (!server) {
-                server = new FolderServer(root);
-                this.servers.set(root, server);
-            }
-            await server.start();
-            return server.urlFor(file);
+            return (await this.serverFor(root)).urlFor(file);
         }
         let url: URL;
         try {
@@ -442,47 +474,159 @@ export class BrowserServiceImpl implements BrowserService, BackendApplicationCon
         await page.setCacheEnabled(false);
         const version = (await browser.version()).replace(/^HeadlessChrome\//, '');
         const state: PageState = {
-            browser, page, label: `${found.name} ${version}`, log: new LogCollector(),
+            browser, page, label: `${found.name} ${version}`, log: new LogCollector(), viewLog: new LogCollector(),
             viewport: { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT }
         };
-        page.on('console', (message: ConsoleMessage) => {
-            const text = message.text();
-            if (NOISE.some(pattern => pattern.test(text))) {
-                return;
-            }
-            const location = message.location();
-            const source = location?.url ? `${location.url}${location.lineNumber !== undefined ? `:${location.lineNumber + 1}` : ''}` : undefined;
-            const type = message.type();
-            state.log.add(type === 'warn' ? 'warning' : type === 'assert' ? 'error' : type, text, source);
-        });
-        page.on('pageerror', (error: unknown) => {
-            const err = error instanceof Error ? error : new Error(String(error));
-            const frames = (err.stack ?? '').split('\n').filter(line => /^\s+at /.test(line)).slice(0, 4).map(line => line.trim());
-            state.log.add('exception', [`${err.name}: ${err.message}`, ...frames].join('\n'));
-        });
-        page.on('requestfailed', (request: HTTPRequest) => {
-            const reason = request.failure()?.errorText ?? 'failed';
-            // Requests cut short by a navigation or by the page itself are not errors of the page.
-            if (reason !== 'net::ERR_ABORTED') {
-                state.log.add('network', `${reason}: ${request.method()} ${request.url()}`);
-            }
-        });
-        page.on('response', (response: HTTPResponse) => {
-            const status = response.status();
-            if (status >= 400 && !/\/favicon\.ico(\?|$)/.test(response.url())) {
-                state.log.add('network', `HTTP ${status} ${response.statusText()}: ${response.request().method()} ${response.url()}`);
-            }
-        });
-        page.on('dialog', (dialog: Dialog) => {
-            state.log.add('dialog', `${dialog.type()}(${JSON.stringify(dialog.message())}) — answered OK automatically`);
-            dialog.accept(dialog.type() === 'prompt' ? dialog.defaultValue() : undefined).catch(() => undefined);
-        });
+        watchPage(page, () => state.log);
         browser.on('disconnected', () => {
             if (this.state?.browser === browser) {
                 this.state = undefined;
             }
         });
         return state;
+    }
+
+    // ---------------------------------------------------------------- view3d
+
+    view3d(request: View3dRequest): Promise<View3dResult> {
+        const next = this.queue.then(() => this.doView3d(request));
+        this.queue = next.catch(() => undefined);
+        return next;
+    }
+
+    protected async doView3d(request: View3dRequest): Promise<View3dResult> {
+        this.scheduleIdleClose();
+        const viewport = { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT };
+        const materials = request.materials === true;
+        const result: View3dResult = { objects: [], notes: [], materials, log: [], logOmitted: 0, viewport };
+        const root = resolve(request.root);
+        const file = resolve(request.file);
+        if (file !== root && !file.startsWith(root + sep)) {
+            return { ...result, error: `${request.file} is outside the workspace (${request.root}).` };
+        }
+        if (!existsSync(file) || !(await fs.stat(file)).isFile()) {
+            return { ...result, error: `There is no file ${request.file}.` };
+        }
+        result.workspacePath = relative(root, file).split(sep).join('/');
+        const ext = extname(file).toLowerCase();
+        const kind = VIEW3D_MODEL_EXTENSIONS.includes(ext) ? 'model' : VIEW3D_SCRIPT_EXTENSIONS.includes(ext) ? 'module' : undefined;
+        if (!kind) {
+            return {
+                ...result, error: /^\.[cm]?tsx?$/.test(ext)
+                    ? 'view3d runs JavaScript modules, not TypeScript: export the function that builds the object from a .js file, or build the '
+                    + 'project and pass the built .js file.'
+                    : `view3d shows a JavaScript module that builds the object (.js, .mjs) or a model file (${VIEW3D_MODEL_EXTENSIONS.join(', ')}), `
+                    + `not a ${ext || 'file without an extension'}.`
+            };
+        }
+        const source = kind === 'module' ? await fs.readFile(file, 'utf8').catch(() => undefined) : undefined;
+        const map = await importMapFor(root, dirname(file), source);
+        if (!map.imports.three) {
+            return {
+                ...result, error: 'view3d draws with three.js, and this project has none it can load: there is no node_modules/three '
+                    + '(install it with `npm install three`) and no import map for "three" in an index.html.'
+            };
+        }
+        result.threeFrom = map.threeFrom;
+        result.exportName = kind === 'module' ? request.exportName?.trim() || undefined : undefined;
+
+        let state: PageState;
+        let page: Page;
+        let server: FolderServer;
+        try {
+            server = await this.serverFor(root);
+            state = await this.ensurePage(request.executablePath);
+            page = await this.ensureViewPage(state);
+        } catch (error) {
+            return { ...result, error: errorMessage(error) };
+        }
+        result.browser = state.label;
+        const spec = {
+            kind, url: server.pathFor(file), ext, name: basename(file), exportName: result.exportName,
+            calls: (request.calls ?? []).filter(Array.isArray).slice(0, VIEW3D_MAX_OBJECTS), materials
+        };
+        server.setVirtual(VIEW3D_PAGE, 'text/html; charset=utf-8', view3dPage(map.imports, spec));
+        server.setVirtual(VIEW3D_MODULE, 'text/javascript; charset=utf-8', VIEW3D_SCRIPT);
+        if ((request.calls?.length ?? 0) > VIEW3D_MAX_OBJECTS) {
+            result.notes.push(`Only the first ${VIEW3D_MAX_OBJECTS} calls are shown; make another view3d call for the rest.`);
+        }
+
+        state.viewLog = new LogCollector();
+        let outcome: { error?: string; thrown?: boolean; revision?: string; objects?: View3dObject[]; notes?: string[] } | undefined;
+        try {
+            await page.bringToFront().catch(() => undefined);
+            await page.setViewport({ ...viewport, deviceScaleFactor: 1 });
+            await page.goto(`${server.origin}${VIEW3D_PAGE}`, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT_MS });
+            const handle = await page.waitForFunction('window.__callistoView3d && window.__callistoView3d.result', { timeout: VIEW3D_TIMEOUT_MS });
+            outcome = await handle.jsonValue() as typeof outcome;
+            await handle.dispose();
+        } catch (error) {
+            const message = errorMessage(error);
+            outcome = {
+                error: /timeout/i.test(message)
+                    ? `The object was not drawn within ${VIEW3D_TIMEOUT_MS / 1000} s: the module may never finish loading (see the log), or `
+                    + 'building the object takes too long.'
+                    : message
+            };
+        }
+        if (outcome?.error) {
+            result.error = stripOrigin(outcome.error, server);
+        } else {
+            result.objects = outcome?.objects ?? [];
+            result.notes.push(...outcome?.notes ?? []);
+            result.revision = outcome?.revision;
+            try {
+                const base64 = await page.screenshot({ type: 'jpeg', quality: SCREENSHOT_QUALITY, encoding: 'base64' });
+                result.screenshot = { base64, mimeType: 'image/jpeg' };
+            } catch (error) {
+                result.error = `Could not take the picture: ${errorMessage(error)}`;
+            }
+        }
+        const { log, omitted } = state.viewLog.report();
+        state.viewLog = new LogCollector();
+        result.log = log
+            .filter(entry => !(entry.kind === 'network' && entry.text.includes('/favicon.ico')))
+            .map(entry => ({ ...entry, text: stripOrigin(entry.text, server), source: entry.source && this.shorten(entry.source, server) }));
+        result.logOmitted = omitted;
+        const hints = new Set<string>();
+        for (const text of [result.error ?? '', ...log.map(entry => entry.text)]) {
+            const bare = text.match(/Failed to resolve module specifier "([^"]+)"/i)?.[1];
+            if (bare) {
+                hints.add(`The module imports "${bare}", which is not installed in the project's node_modules (and not in an import map): `
+                    + 'install it, or import it by a relative path.');
+            }
+            if (/SyntaxError/.test(text)) {
+                hints.add(`The module does not parse; \`node --check ${result.workspacePath}\` shows the line.`);
+            }
+            if (/does not provide an export named/i.test(text)) {
+                hints.add('An import names something the imported module does not export: check the import against the module\'s exports.');
+            }
+        }
+        if (hints.size > 0) {
+            result.hints = [...hints];
+        }
+        return result;
+    }
+
+    protected async serverFor(root: string): Promise<FolderServer> {
+        let server = this.servers.get(root);
+        if (!server) {
+            server = new FolderServer(root);
+            this.servers.set(root, server);
+        }
+        await server.start();
+        return server;
+    }
+
+    protected async ensureViewPage(state: PageState): Promise<Page> {
+        if (state.viewPage && !state.viewPage.isClosed()) {
+            return state.viewPage;
+        }
+        const page = await state.browser.newPage();
+        await page.setCacheEnabled(false);
+        watchPage(page, () => state.viewLog);
+        state.viewPage = page;
+        return page;
     }
 
     protected async perform(page: Page, action: BrowserAction): Promise<{ ok: boolean; message: string }> {
@@ -666,6 +810,56 @@ export class BrowserServiceImpl implements BrowserService, BackendApplicationCon
         }
         this.servers.clear();
     }
+}
+
+/** Records what a page logs, throws, and fails to load into the collector `log()` returns at the time. */
+function watchPage(page: Page, log: () => LogCollector): void {
+    page.on('console', (message: ConsoleMessage) => {
+        const text = message.text();
+        if (NOISE.some(pattern => pattern.test(text))) {
+            return;
+        }
+        const location = message.location();
+        const source = location?.url ? `${location.url}${location.lineNumber !== undefined ? `:${location.lineNumber + 1}` : ''}` : undefined;
+        const type = message.type();
+        log().add(type === 'warn' ? 'warning' : type === 'assert' ? 'error' : type, text, source);
+    });
+    page.on('pageerror', (error: unknown) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        const frames = (err.stack ?? '').split('\n').filter(line => /^\s+at /.test(line)).slice(0, 4).map(line => line.trim());
+        log().add('exception', [`${err.name}: ${err.message}`, ...frames].join('\n'));
+    });
+    page.on('requestfailed', (request: HTTPRequest) => {
+        const reason = request.failure()?.errorText ?? 'failed';
+        // Requests cut short by a navigation or by the page itself are not errors of the page.
+        if (reason !== 'net::ERR_ABORTED') {
+            log().add('network', `${reason}: ${request.method()} ${request.url()}`);
+        }
+    });
+    page.on('response', (response: HTTPResponse) => {
+        const status = response.status();
+        if (status >= 400 && !/\/favicon\.ico(\?|$)/.test(response.url())) {
+            log().add('network', `HTTP ${status} ${response.statusText()}: ${response.request().method()} ${response.url()}`);
+        }
+    });
+    page.on('dialog', (dialog: Dialog) => {
+        log().add('dialog', `${dialog.type()}(${JSON.stringify(dialog.message())}) — answered OK automatically`);
+        dialog.accept(dialog.type() === 'prompt' ? dialog.defaultValue() : undefined).catch(() => undefined);
+    });
+}
+
+/** The viewer page: the job, the import map that gives it the project's three.js, and the viewer module. */
+function view3dPage(imports: Record<string, string>, spec: object): string {
+    const json = (value: unknown) => JSON.stringify(value).replace(/</g, '\\u003c');
+    return '<!doctype html><html><head><meta charset="utf-8"><title>Callisto view3d</title>'
+        + `<script>window.__callistoView3d = { spec: ${json(spec)} };</script>`
+        + `<script type="importmap">${json({ imports })}</script>`
+        + `<style>${VIEW3D_CSS}</style></head><body><script type="module" src="${VIEW3D_MODULE}"></script></body></html>`;
+}
+
+/** Text with the folder server's URLs shortened to workspace paths. */
+function stripOrigin(text: string, server: FolderServer): string {
+    return text.split(`${server.origin}/`).join('');
 }
 
 /**

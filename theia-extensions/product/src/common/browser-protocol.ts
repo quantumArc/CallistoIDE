@@ -111,11 +111,84 @@ export interface BrowserResult {
     error?: string;
 }
 
+/** The agent's tool for looking at a 3D object it built: several views in one image, and geometry checks. */
+export const VIEW3D_FUNCTION_ID = 'view3d';
+
+/** Model files view3d opens with three.js's own loaders. */
+export const VIEW3D_MODEL_EXTENSIONS = ['.glb', '.gltf', '.obj', '.stl', '.ply', '.fbx'];
+
+export interface View3dRequest {
+    /**
+     * Absolute path of the file to show, inside `root`: a JavaScript module that builds the object with three.js, or a
+     * model file ({@link VIEW3D_MODEL_EXTENSIONS}).
+     */
+    file: string;
+    root: string;
+    /** Module: the export to show, a function that returns the object or the object itself. Default: the default export. */
+    exportName?: string;
+    /** Module: argument lists, one object per list, shown side by side. Default: one call without arguments. */
+    calls?: unknown[][];
+    /** Draw the object's own materials instead of plain grey clay. */
+    materials?: boolean;
+    executablePath?: string;
+}
+
+export interface View3dObject {
+    /** e.g. `buildPieceMesh("n", "w")`, or the file name of a model. */
+    label: string;
+    /** e.g. "0.64 wide (x) × 0.70 tall (y) × 0.23 deep (z)". */
+    sizeText: string;
+    /** Lowest y, formatted. */
+    bottomText: string;
+    /** Centre of its footprint, e.g. "x 0.00, z 0.00". */
+    centerText: string;
+    parts: number;
+    triangles: number;
+    /** e.g. "1 LatheGeometry, 8 SphereGeometry". */
+    partTypes: string;
+    /** One line per part (the first few): type, size and position. */
+    partList: string[];
+    partsOmitted: number;
+    /** What the checks found: loose parts, holes, coarse lathe profiles, flat extrusions, missing normals. */
+    warnings: View3dWarning[];
+}
+
+export interface View3dWarning {
+    /** What is wrong, with the part and where it is. */
+    text: string;
+    /** How to fix it; the same for every warning of a kind, so a report says it once. */
+    fix?: string;
+}
+
+export interface View3dResult {
+    /** The file shown, relative to the workspace root. */
+    workspacePath?: string;
+    /** The module export that was shown. */
+    exportName?: string;
+    objects: View3dObject[];
+    /** Findings across objects, e.g. two that share an identical part. */
+    notes: string[];
+    /** three.js revision the page ran, e.g. "160". */
+    revision?: string;
+    /** Where three.js came from, e.g. "node_modules/three" or an import map in index.html. */
+    threeFrom?: string;
+    materials: boolean;
+    log: BrowserLogEntry[];
+    logOmitted: number;
+    screenshot?: { base64: string; mimeType: 'image/jpeg' | 'image/png' };
+    viewport: { width: number; height: number };
+    browser?: string;
+    hints?: string[];
+    error?: string;
+}
+
 /**
  * A headless Chrome in the backend that the agent drives through {@link BROWSER_FUNCTION_ID}. One page is kept open
  * between calls, so the agent can open a page, look, click, and look again; it is closed after a few idle minutes.
+ * {@link VIEW3D_FUNCTION_ID} draws objects on a second page of the same browser.
  */
 export interface BrowserService {
     run(request: BrowserRequest): Promise<BrowserResult>;
+    view3d(request: View3dRequest): Promise<View3dResult>;
     close(): Promise<void>;
 }

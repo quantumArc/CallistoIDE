@@ -81,7 +81,8 @@ export const CallistoAgentPreferencesSchema: PreferenceSchema = {
             markdownDescription: 'Let the Callisto agent check web pages it builds in a headless browser (`browser` tool): open an HTML file '
                 + 'of the workspace or a dev server on this machine, click and type as a user would, and get back the console errors, '
                 + 'the visible text and a screenshot. A model that can see images (Inkling 2 Mini can) looks at the screenshot itself; '
-                + 'others get the text only. It opens only pages on this machine, never the internet. Details: `docs/browser.md`.'
+                + 'others get the text only. It opens only pages on this machine, never the internet. The same browser draws 3D '
+                + 'objects for the `view3d` tool. Details: `docs/browser.md`, `docs/3d-models.md`.'
         },
         [BROWSER_EXECUTABLE_PREF]: {
             type: 'string',

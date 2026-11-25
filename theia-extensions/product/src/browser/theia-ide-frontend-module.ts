@@ -32,6 +32,7 @@ import { WEB_SEARCH_PATH, WebSearchService } from '../common/web-search-protocol
 import { FetchWebPageTool, WebSearchTool } from './web-search-tools.js';
 import { BROWSER_SERVICE_PATH, BrowserService } from '../common/browser-protocol.js';
 import { BrowserTool } from './browser-tool.js';
+import { View3dTool } from './view3d-tool.js';
 import { bindToolProvider } from '@theia/ai-core/lib/common';
 import { Agent } from '@theia/ai-core/lib/common';
 import { ChatAgent } from '@theia/ai-chat/lib/common';
@@ -102,6 +103,7 @@ export default new ContainerModule((bind, _unbind, isBound, rebind) => {
         ctx.container.get<ServiceConnectionProvider>(RemoteConnectionProvider).createProxy<BrowserService>(BROWSER_SERVICE_PATH)
     ).inSingletonScope();
     bindToolProvider(BrowserTool, bind);
+    bindToolProvider(View3dTool, bind);
     bind(SyntaxCheckService).toDynamicValue(ctx =>
         ctx.container.get<ServiceConnectionProvider>(RemoteConnectionProvider).createProxy<SyntaxCheckService>(SYNTAX_CHECK_PATH)
     ).inSingletonScope();

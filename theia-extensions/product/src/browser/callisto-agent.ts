@@ -34,7 +34,9 @@ import { CALLISTO_REASONING_SIGNATURE, LOW_REASONING_UNTIL_ACTION_SETTING } from
 import { carriedThinking } from '../common/carried-thinking.js';
 import { commandFailed, describe, keptReasoning, NudgeContext, nudgeFor } from '../common/callisto-nudges.js';
 import { SyntaxCheckResult, SyntaxCheckService } from '../common/syntax-check-protocol.js';
-import { BROWSER_FUNCTION_ID } from '../common/browser-protocol.js';
+import { BROWSER_FUNCTION_ID, VIEW3D_FUNCTION_ID } from '../common/browser-protocol.js';
+import { buildsThreeGeometry, mentions3d, MODELLING_GUIDE, MODELLING_GUIDE_TITLE, THREE_D_PACKAGES } from '../common/modelling-guide.js';
+import { FileService } from '@theia/filesystem/lib/browser/file-service';
 import { messagesChars, splitToolImages, withoutToolImages } from '../common/tool-images.js';
 import { LOOP_BREAKER_PREF, MAX_THINKING_TOKENS_PREF, SUMMARIZE_AFTER_TOKENS_PREF } from './callisto-agent-preferences.js';
 import { contextOverflowMessage, parseContextOverflow } from '../common/context-overflow.js';
@@ -110,6 +112,10 @@ const CODE_FILE = /\.(m?js|cjs|jsx|tsx?|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp
 const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|[._-](test|spec)\.[a-z]+$/i;
 
 const RUN_IT_NOTE = 'Next: check this file by running it (the tests, or a short script that exercises it), not by re-reading it in your head.';
+const VIEW3D_NOTE = 'Next: look at the objects this file builds with view3d (`path`, `export`, `calls`; export a function that returns '
+    + 'each object if there is none) and fix what it shows, before you check the app itself.';
+/** Tools whose results carry images, which a model without vision gets as text only. */
+const IMAGE_TOOLS = new Set([BROWSER_FUNCTION_ID, VIEW3D_FUNCTION_ID]);
 const TEST_CHANGED_NOTE = 'Callisto note: your last command failed and you have now changed a test. Only do that if the test itself was wrong, '
     + 'not the code under test. Say in one sentence why the old expectation was wrong; if you are not sure, prove it first with a quick '
     + 'check (for example `node -e` or `python3 -c`).';
@@ -184,6 +190,9 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
 
     @inject(CommandService)
     protected readonly commandService: CommandService;
+
+    @inject(FileService)
+    protected readonly fileService: FileService;
 
     id = CALLISTO_AGENT_ID;
     name = CALLISTO_AGENT_ID;
@@ -555,9 +564,44 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                 CALLISTO_REQUEST_CONTEXT_ID, undefined, { model, request: request as MutableChatRequestModel });
             const text = resolved?.text.trim();
             notes = text ? [{ actor: 'user', type: 'text', text: `[Callisto] Context for this request:\n\n${text}` }] : [];
+            if (await this.needsModellingGuide(request, model)) {
+                notes.push({ actor: 'user', type: 'text', text: MODELLING_GUIDE });
+            }
             this.requestNotes.set(request.id, notes);
         }
         return notes ?? [];
+    }
+
+    /**
+     * Whether a request gets Callisto's notes on modelling 3D objects: when it or the workspace is about 3D, and no
+     * earlier request of the chat that the model still sees (not covered by a summary) got them.
+     */
+    protected async needsModellingGuide(request: ChatRequestModel, model: ChatModel): Promise<boolean> {
+        const requests = model.getRequests();
+        const summary = latestSummary(requests);
+        const visible = requests.slice(summary ? summary.index + 1 : 0);
+        const given = visible.some(other => other !== request && this.requestNotes.get(other.id)?.some(note =>
+            note.type === 'text' && note.text.startsWith(MODELLING_GUIDE_TITLE)));
+        if (given) {
+            return false;
+        }
+        return mentions3d(request.message.parts.map(part => part.promptText).join('')) || this.workspaceUses3d();
+    }
+
+    /** Whether a workspace root's package.json depends on a 3D library such as three.js. */
+    protected async workspaceUses3d(): Promise<boolean> {
+        for (const root of this.workspaceScope.getRootMapping().values()) {
+            try {
+                const pkg = JSON.parse((await this.fileService.read(root.resolve('package.json'))).value);
+                const dependencies = { ...pkg?.dependencies, ...pkg?.devDependencies };
+                if (THREE_D_PACKAGES.some(name => name in dependencies)) {
+                    return true;
+                }
+            } catch {
+                // No package.json, or not JSON.
+            }
+        }
+        return false;
     }
 
     /**
@@ -892,7 +936,7 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
                     const notes = await this.notesAfterWrite(argString, state);
                     return notes ? `${result}\n\n${notes}` : result;
                 }
-                if (tool.id === BROWSER_FUNCTION_ID) {
+                if (IMAGE_TOOLS.has(tool.id)) {
                     const languageModel = this.llmCalls.get(request)?.languageModel;
                     if (languageModel && !this.seesImages(languageModel)) {
                         return withoutToolImages(result, imagesLeftOut(languageModel));
@@ -923,9 +967,19 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
         if (TEST_FILE.test(path) && state.lastRunFailed) {
             notes.push(TEST_CHANGED_NOTE);
         } else if (CODE_FILE.test(path) && check?.ok !== false) {
-            notes.push(RUN_IT_NOTE);
+            notes.push(/\.(m?js|jsx|tsx?)$/i.test(path) && await this.buildsGeometry(path) ? VIEW3D_NOTE : RUN_IT_NOTE);
         }
         return notes.length > 0 ? notes.join('\n') : undefined;
+    }
+
+    /** Whether a file the model just wrote builds three.js geometry, so that it is pointed at view3d. */
+    protected async buildsGeometry(path: string): Promise<boolean> {
+        try {
+            const uri = await this.workspaceScope.resolveAccessiblePath(path);
+            return buildsThreeGeometry((await this.fileService.read(uri)).value);
+        } catch {
+            return false;
+        }
     }
 
     protected async checkSyntax(path: string): Promise<SyntaxCheckResult | undefined> {
@@ -961,7 +1015,7 @@ export class CallistoAgent extends AbstractModeAwareChatAgent {
 }
 
 function imagesLeftOut(languageModel: LanguageModel): string {
-    return `Screenshot left out: ${languageModel.id.replace(/^[^/]+\//, '')} cannot see images. Judge the page by the log, controls and text above.`;
+    return `Image left out: ${languageModel.id.replace(/^[^/]+\//, '')} cannot see images. Go by the text above.`;
 }
 
 function isCarriedThinking(message: LanguageModelMessage): boolean {

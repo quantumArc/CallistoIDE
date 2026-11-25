@@ -1,0 +1,10 @@
+{
+    "title": "Rework two crude 3D chess pieces so they look like the real thing",
+    "setup": ["npm", "install", "--no-audit", "--no-fund", "--prefer-offline"],
+    "turns": [
+        {
+            "message": "@Callisto The chess pieces in this project (src/pieces.js) look crude. Rework the rook and the knight so they look like real Staunton chess pieces. Leave the other pieces as they are and keep buildPiece's signature.",
+            "timeoutMinutes": 20
+        }
+    ]
+}

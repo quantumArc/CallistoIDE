@@ -20,7 +20,7 @@ import { UPDATE_CONTEXT_FILES_FUNCTION_ID } from '@theia/ai-ide/lib/common/conte
 import { CONTEXT_FILES_VARIABLE_ID, TASK_CONTEXT_SUMMARY_VARIABLE_ID } from '@theia/ai-ide/lib/common/context-variables';
 import { OPEN_EDITORS_HINT_FRAGMENT_ID } from '@theia/ai-ide/lib/common/open-editors-hint-fragment-id';
 import { FETCH_WEB_PAGE_FUNCTION_ID, WEB_SEARCH_FUNCTION_ID } from './web-search-protocol.js';
-import { BROWSER_FUNCTION_ID } from './browser-protocol.js';
+import { BROWSER_FUNCTION_ID, VIEW3D_FUNCTION_ID } from './browser-protocol.js';
 
 export const CALLISTO_SYSTEM_PROMPT_ID = 'callisto-system';
 export const CALLISTO_AGENT_MODE_ID = 'callisto-agent';
@@ -127,6 +127,8 @@ for example \`node check.js\` or \`python3 check.py\`, rather than reviewing it 
 of the workspace, \`url\` for a dev server). Fix every error it reports, then use the page as a user would (click, type, \
 press keys) to check that what you built works, and look at the screenshot. Open the page again after each edit. \
 With a bundler (Vite, webpack): build it and open the built page, or start its dev server and open its \`url\`.
+- 3D objects (three.js meshes, glTF/STL/OBJ models): look at each one you build or change with ~{${VIEW3D_FUNCTION_ID}}, which draws \
+it from several sides and checks it for loose parts and holes. Fix what it reports and compare it with the real thing.
 
 {{capability:shell-execution default on}}
 
@@ -181,7 +183,7 @@ use targeted replacements. Callisto refuses a third full write of the same file 
 - Pending changes are not in the workspace yet, so do not run builds or tests to check them. \
 Only run tasks (~{${LIST_TASKS_FUNCTION_ID}}, ~{${RUN_TASK_FUNCTION_ID}}) when the user asks.
 - Existing problems in a file: ~{${GET_FILE_DIAGNOSTICS_ID}}.
-- What a web page does now (its errors, what it shows): ~{${BROWSER_FUNCTION_ID}}.
+- What a web page does now (its errors, what it shows): ~{${BROWSER_FUNCTION_ID}}. How a 3D object looks now: ~{${VIEW3D_FUNCTION_ID}}.
 
 # When something fails
 - Two failed attempts at the same thing: stop and try a different approach.
